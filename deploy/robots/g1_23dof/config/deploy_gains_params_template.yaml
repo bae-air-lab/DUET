@@ -1,0 +1,87 @@
+# Template params/deploy.yaml for policies trained with the DeployGains task
+# variants (Unitree-G1-23Dof-LocoManip-*-DeployGains).
+#
+# Copy this over params/deploy.yaml in the new policy version dir (e.g.
+# config/policy/velocity/v1/params/deploy.yaml) alongside the exported
+# policy.onnx, then update the commands/actions/observations sections if the
+# task interface changed (this template assumes the v7 interface: 13 actions,
+# base_height command appended last).
+#
+# CRITICAL: stiffness/damping/scale below MUST match the training-time values
+# of the DeployGains variant (g1_23dof_deploy_constants.py):
+#   legs  kp 100,100,100,150,40,40 / kd 2,2,2,4,2,2
+#   waist kp 200 / kd 5
+#   arms  kp 40 / kd 10
+#   action scale: uniform 0.25
+# Deploying a DeployGains policy with the old (40.2/99.1/28.5) table -- or an
+# old policy with this table -- breaks the trained closed loop.
+
+joint_ids_map: [0,1,2,3,4,5,6,7,8,9,10,11,12,15,16,17,18,19,22,23,24,25,26]
+step_dt: 0.02
+stiffness: [100, 100, 100, 150, 40, 40, 100, 100, 100, 150, 40, 40, 200,
+            40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+damping:   [2, 2, 2, 4, 2, 2, 2, 2, 2, 4, 2, 2, 5,
+            10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+default_joint_pos: [-0.1,0,0,0.3,-0.2,0, -0.1,0,0,0.3,-0.2,0,  0,  0.35,0.18,0,0.87,0, 0.35,-0.18,0,0.87,0]
+
+commands:
+  base_velocity:
+    ranges:
+      lin_vel_x: [-0.5, 1.0]
+      lin_vel_y: [-0.5, 0.5]
+      ang_vel_z: [-1.0, 1.0]
+      heading: null
+  base_height:
+    range: [0.12, 0.73]
+    standstill: 0.73
+actions:
+  JointPositionAction:
+    clip: null
+    joint_names: [.*]
+    joint_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    # Uniform 0.25 (unitree_rl_gym convention), matching the DeployGains task.
+    scale:  [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
+    offset: [-0.1, 0, 0, 0.3, -0.2, 0, -0.1, 0, 0, 0.3, -0.2, 0, 0]
+observations:
+  base_ang_vel:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  projected_gravity:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  velocity_commands:
+    params: {command_name: base_velocity}
+    clip: null
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  gait_phase:
+    params: {period: 0.6}
+    clip: null
+    scale: [1.0, 1.0]
+    history_length: 1
+  joint_pos_rel:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
+  joint_vel_rel:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
+  last_action:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
+  base_height_command:
+    params: {}
+    clip: null
+    scale: [1.0]
+    history_length: 1

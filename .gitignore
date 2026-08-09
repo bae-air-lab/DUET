@@ -1,0 +1,32 @@
+# training output
+logs/
+outputs/
+wandb/
+runs/
+MUJOCO_LOG.TXT
+*.pt
+!exported/model_15500.pt
+
+# build artefacts
+deploy/robots/*/build/
+simulate/build/
+*.egg-info
+__pycache__/
+*.py[cod]
+*.so
+!deploy/thirdparty/**/*.so*
+
+# paper sources, capture media and scratch material, kept out of the release
+documents/
+medias/
+keep/
+*.pptx
+*.MOV
+!Robot.mp4
+
+# editors / os
+.idea
+.vscode
+.DS_Store
+*.bak
+*.swp

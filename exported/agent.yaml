@@ -1,0 +1,67 @@
+seed: 1
+num_steps_per_env: 24
+max_iterations: 4501
+obs_groups:
+  actor: !!python/tuple
+  - actor
+  critic: !!python/tuple
+  - critic
+save_interval: 500
+experiment_name: DUET_G1_23dof
+run_name: duet_v3_refined
+logger: wandb
+wandb_project: mjlab
+wandb_tags: !!python/tuple []
+resume: true
+load_run: 2026-08-06_23-55-28_duet_v2_idleprec
+load_checkpoint: model_13500.pt
+clip_actions: null
+upload_model: true
+class_name: OnPolicyRunner
+actor:
+  hidden_dims: !!python/tuple
+  - 512
+  - 256
+  - 128
+  activation: elu
+  obs_normalization: true
+  cnn_cfg: null
+  distribution_cfg:
+    class_name: GaussianDistribution
+    init_std: 1.0
+    std_type: scalar
+  class_name: MLPModel
+critic:
+  hidden_dims: !!python/tuple
+  - 512
+  - 256
+  - 128
+  activation: elu
+  obs_normalization: true
+  cnn_cfg: null
+  distribution_cfg: null
+  class_name: MLPModel
+algorithm:
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.001
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  entropy_coef: 0.01
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  normalize_advantage_per_mini_batch: false
+  optimizer: adam
+  share_cnn_encoders: false
+  class_name: PPO
+  symmetry_mode: both
+  mirror_loss_coeff: 1.0
+  entropy_schedule:
+    high: 0.01
+    low: 0.006
+    hold_iters: 7000
+    decay_iters: 2000
