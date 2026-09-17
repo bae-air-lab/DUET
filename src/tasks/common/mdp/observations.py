@@ -53,3 +53,20 @@ def phase(env: ManagerBasedRlEnv, period: float, command_name: str) -> torch.Ten
     phase = torch.where(stand_mask.unsqueeze(1), torch.zeros_like(phase), phase)
     return phase
 
+
+
+def arm_traj_vel(
+  env: ManagerBasedRlEnv, action_term_name: str = "upper_body_pose"
+) -> torch.Tensor:
+  """Target velocity of the externally driven arm joints (rad/s). [B, J].
+
+  Arm trajectory INTENT, as opposed to the measured arm joint velocity that is
+  already in ``joint_vel``: it is the generator's commanded velocity during
+  training and the finite difference of the external targets at deployment.
+  Given to the CRITIC only in the DUET config -- it lets the value function
+  anticipate an arm-induced disturbance without widening the actor's 71-D
+  deployment interface. Adding it to the actor would require the C++ controller
+  to publish dq_ref alongside q_ref; that is documented as a future step.
+  """
+  term = env.action_manager.get_term(action_term_name)
+  return term.traj_vel

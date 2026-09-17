@@ -49,9 +49,12 @@ pip install -e .            # pulls mjlab==1.2.0 and mujoco-warp==3.5.0
 ## Train
 
 ```bash
-python scripts/train.py Unitree-G1-23Dof-Duet-Flat \
+PYTHONPATH=. python scripts/train.py Unitree-G1-23Dof-Duet-Flat \
     --agent.seed 1 --env.scene.num-envs 4096 --agent.run-name duet
 ```
+
+`PYTHONPATH=.` matters on a machine where an editable `src` package from a sibling
+checkout is installed; without it the scripts import that checkout's tasks.
 
 Checkpoints land in `logs/rsl_rl/DUET_G1_23dof/<run>/`. Resuming continues the command,
 arm-pose and entropy curricula where they stopped — every curriculum is keyed to the
@@ -65,6 +68,17 @@ python scripts/play.py --task Unitree-G1-23Dof-Duet-Flat \
 ```
 
 The whole-body baseline is `Unitree-G1-23Dof-Flat`, trained the same way.
+
+The arm-robustness training recipe (asynchronous trapezoidal arm trajectories over
+a safe workspace, staged curriculum, pelvis-anchor deadband, whole-body CoM support
+term, diagnostics) is described in
+[`documents/duet/arm_robustness.md`](documents/duet/arm_robustness.md). The eight
+digital-twin acceptance scenarios run with:
+
+```bash
+PYTHONPATH=. python scripts/duet_arm_scenarios.py \
+    --checkpoint logs/rsl_rl/DUET_G1_23dof/<run>/model_XXXX.pt
+```
 
 ### Ablations
 

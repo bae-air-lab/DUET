@@ -17,7 +17,6 @@ __pycache__/
 !deploy/thirdparty/**/*.so*
 
 # paper sources, capture media and scratch material, kept out of the release
-documents/
 medias/
 keep/
 *.pptx

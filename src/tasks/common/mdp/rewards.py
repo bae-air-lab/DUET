@@ -589,16 +589,21 @@ def idle_base_motion(
     asset: Entity = env.scene[asset_cfg.name]
     lin_vel = asset.data.root_link_lin_vel_b
     ang_vel = asset.data.root_link_ang_vel_b
-    cost = torch.sum(torch.square(lin_vel[:, :2]), dim=1) + 0.5 * torch.square(
-      ang_vel[:, 2]
-    )
+    lin_cost = torch.sum(torch.square(lin_vel[:, :2]), dim=1)
+    ang_cost = 0.5 * torch.square(ang_vel[:, 2])
     command = env.command_manager.get_command(command_name)
     if command is not None:
-        linear_norm = torch.norm(command[:, :2], dim=1)
-        angular_norm = torch.abs(command[:, 2])
-        idle = ((linear_norm + angular_norm) <= command_threshold).float()
-        cost = cost * idle
-    return cost
+        # Gate the two channels SEPARATELY. The old gate required the TOTAL
+        # command (linear + |yaw|) to be near zero, which switched the whole
+        # term off during a commanded turn -- exactly the case where planar
+        # velocity should be zero and nothing was watching it. Measured on
+        # model_19000: standing (gate on) leaves 0.000 m/s residual, while a
+        # pure 0.3 rad/s yaw (gate off) leaves +0.067 m/s of forward drift, so
+        # the robot orbits instead of spinning on the spot.
+        lin_idle = (torch.norm(command[:, :2], dim=1) <= command_threshold).float()
+        yaw_idle = (torch.abs(command[:, 2]) <= command_threshold).float()
+        return lin_cost * lin_idle + ang_cost * yaw_idle
+    return lin_cost + ang_cost
 
 
 class idle_position_anchor(ManagerTermBase):
@@ -627,14 +632,18 @@ class idle_position_anchor(ManagerTermBase):
     super().__init__(env)
     self.anchor_xy = torch.zeros(env.num_envs, 2, device=env.device)
     self.anchor_yaw = torch.zeros(env.num_envs, device=env.device)
-    self.was_idle = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    # Two independent latches: position is anchored whenever no TRANSLATION is
+    # commanded (including during a pure turn), heading whenever no YAW is.
+    self.was_lin_idle = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    self.was_yaw_idle = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
   def reset(self, env_ids=None) -> None:
     # Force a re-latch after a reset: the robot has been teleported, so the old
     # anchor refers to a position that no longer means anything.
     if env_ids is None:
       env_ids = slice(None)
-    self.was_idle[env_ids] = False
+    self.was_lin_idle[env_ids] = False
+    self.was_yaw_idle[env_ids] = False
 
   def __call__(
     self,
@@ -643,8 +652,21 @@ class idle_position_anchor(ManagerTermBase):
     command_threshold: float = 0.1,
     yaw_weight: float = 0.5,
     max_error: float = 1.0,
+    xy_deadband: float = 0.0,
+    yaw_deadband: float = 0.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
   ) -> torch.Tensor:
+    """See the class docstring.
+
+    ``xy_deadband`` / ``yaw_deadband``: displacement inside the band costs
+    nothing; outside it the cost grows linearly from zero. Why a deadband: with
+    a zero-width anchor the cheapest way for the policy to absorb the forward
+    CoM shift of extended arms was to keep the pelvis mathematically fixed and
+    pitch the torso backward (the orientation term is quadratic and nearly free
+    at small angles). A few centimetres of pelvis travel over stationary feet
+    is the natural ankle/hip compensation; only sustained drift beyond the band
+    is a problem for manipulation, and that is still penalised.
+    """
     asset: Entity = env.scene[asset_cfg.name]
     pos_xy = asset.data.root_link_pos_w[:, :2]
     rot = matrix_from_quat(asset.data.root_link_quat_w)
@@ -652,25 +674,37 @@ class idle_position_anchor(ManagerTermBase):
 
     command = env.command_manager.get_command(command_name)
     assert command is not None
-    total_command = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
-    idle = total_command <= command_threshold
+    # Separate gates. "Turn in place" means the POSITION is held while the
+    # heading changes, so the xy anchor must stay armed through a commanded
+    # yaw; only the heading anchor is released by it. Under the old combined
+    # gate both were released together and a turning robot was free to
+    # translate, which is what made it leave its centre of rotation.
+    lin_idle = torch.norm(command[:, :2], dim=1) <= command_threshold
+    yaw_idle = torch.abs(command[:, 2]) <= command_threshold
 
-    # Latch on the transition into idle; hold it for the whole idle stretch.
-    newly_idle = idle & ~self.was_idle
-    self.anchor_xy[newly_idle] = pos_xy[newly_idle]
-    self.anchor_yaw[newly_idle] = yaw[newly_idle]
-    self.was_idle = idle
+    # Latch each on its own transition into idle; hold for that whole stretch.
+    newly_lin = lin_idle & ~self.was_lin_idle
+    self.anchor_xy[newly_lin] = pos_xy[newly_lin]
+    newly_yaw = yaw_idle & ~self.was_yaw_idle
+    self.anchor_yaw[newly_yaw] = yaw[newly_yaw]
+    self.was_lin_idle = lin_idle
+    self.was_yaw_idle = yaw_idle
+    idle = lin_idle  # what the logged drift metric refers to
 
-    # Clamped so a mis-latch (or a push that carries the robot away) cannot
+    # Raw displacement (logged); the cost is the part outside the deadband,
+    # clamped so a mis-latch (or a push that carries the robot away) cannot
     # produce an unbounded cost that swamps every other term.
-    dist = torch.norm(pos_xy - self.anchor_xy, dim=1).clamp(max=max_error)
-    dyaw = wrap_to_pi(yaw - self.anchor_yaw).abs().clamp(max=max_error)
+    raw_dist = torch.norm(pos_xy - self.anchor_xy, dim=1)
+    raw_dyaw = wrap_to_pi(yaw - self.anchor_yaw).abs()
+    dist = (raw_dist - xy_deadband).clamp(min=0.0, max=max_error)
+    dyaw = (raw_dyaw - yaw_deadband).clamp(min=0.0, max=max_error)
     # setdefault: "log" is absent before the first episode-end aggregation, so a
     # bare index would crash on the very first steps of a run.
-    env.extras.setdefault("log", {})["Metrics/idle_drift_m"] = (
-      dist * idle.float()
-    ).sum() / idle.float().sum().clamp(min=1)
-    return (dist + yaw_weight * dyaw) * idle.float()
+    idle_f = idle.float()
+    log = env.extras.setdefault("log", {})
+    log["Metrics/idle_drift_m"] = (raw_dist * idle_f).sum() / idle_f.sum().clamp(min=1)
+    log["Metrics/idle_drift_max_m"] = (raw_dist * idle_f).max()
+    return dist * idle_f + yaw_weight * dyaw * yaw_idle.float()
 
 
 def idle_feet_still(
@@ -767,3 +801,130 @@ def squat_feet_still(
         cost = cost * deep_squat
     return cost
 
+
+
+def _com_support_ratio(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  asset_cfg: SceneEntityCfg,
+  foot_half_length: float,
+  foot_half_width: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Normalised distance of the whole-body CoM from the double-support region.
+
+  Returns ``(r, double_support)``: ``r`` is the CoM's horizontal offset from
+  the midpoint between the feet, expressed in the base yaw frame and divided by
+  the region's half-extents, so ``r < 1`` is inside the region and ``r = 0`` is
+  its centre. The region is a conservative ellipse: fore-aft half-extent =
+  ``foot_half_length`` + half the fore-aft stagger of the feet, lateral
+  half-extent = half the lateral foot separation + ``foot_half_width``. That
+  is smaller than the true support polygon (an ellipse inscribed in the
+  rectangle spanned by the two feet), which is what we want from a safety
+  margin, and needs no polygon API.
+
+  The CoM is MuJoCo's ``subtree_com`` of the root body: the mass-weighted
+  centre of every link including the arms, hands and any randomised payload
+  mass -- not the pelvis. That is the whole point of the term: when the arms
+  extend, this moves and the pelvis does not.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  sensor: ContactSensor = env.scene[sensor_name]
+  com_xy = asset.data.data.subtree_com[:, asset.data.indexing.root_body_id, :2]
+  feet = asset.data.site_pos_w[:, asset_cfg.site_ids, :2]  # [B, 2, 2]
+  assert sensor.data.found is not None
+  in_contact = sensor.data.found > 0  # [B, 2]
+  double_support = in_contact.sum(dim=1) == 2
+
+  yaw = asset.data.heading_w
+  c, s_ = torch.cos(yaw), torch.sin(yaw)
+  d = com_xy - feet.mean(dim=1)
+  dx = c * d[:, 0] + s_ * d[:, 1]
+  dy = -s_ * d[:, 0] + c * d[:, 1]
+  fd = feet[:, 0] - feet[:, 1]
+  stagger = (c * fd[:, 0] + s_ * fd[:, 1]).abs()
+  separation = (-s_ * fd[:, 0] + c * fd[:, 1]).abs()
+  half_x = foot_half_length + 0.5 * stagger
+  half_y = foot_half_width + 0.5 * separation
+  r = torch.sqrt(torch.square(dx / half_x) + torch.square(dy / half_y) + 1e-8)
+  return r, double_support
+
+
+def com_support_region(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  command_name: str,
+  foot_half_length: float = 0.09,
+  foot_half_width: float = 0.04,
+  safe_fraction: float = 0.5,
+  outside_gain: float = 2.0,
+  moving_scale: float = 0.25,
+  command_threshold: float = 0.1,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalise the whole-body CoM leaving the double-support region.
+
+  Cost as a function of the normalised offset ``r`` (see
+  :func:`_com_support_ratio`)::
+
+      r <= safe_fraction : 0                                   (comfortably inside)
+      safe_fraction..1   : (r - safe_fraction)^2               (approaching the edge)
+      r > 1              : ... + outside_gain * (r - 1)        (outside: strong)
+
+  Evaluated in double support only. In single support the CoM is legitimately
+  outside the stance foot during a step, so penalising it there would fight
+  walking; foot placement handles balance in that regime. While a locomotion
+  command is active the cost is scaled by ``moving_scale`` -- the term exists
+  mainly for stationary manipulation, and a walking robot's CoM oscillates
+  around the support centre by design. Together with the pelvis deadband in
+  ``idle_position_anchor`` this is what lets the policy answer an arm-induced
+  CoM shift with a small pelvis/ankle adjustment instead of a torso lean:
+  keeping the CoM centred is now rewarded directly, and the cheap way to do it
+  (shift the pelvis a couple of centimetres) is no longer penalised.
+  """
+  r, double_support = _com_support_ratio(
+    env, sensor_name, asset_cfg, foot_half_length, foot_half_width
+  )
+  cost = torch.square((r - safe_fraction).clamp(min=0.0)) + outside_gain * (
+    r - 1.0
+  ).clamp(min=0.0)
+  cost = cost * double_support.float()
+  command = env.command_manager.get_command(command_name)
+  if command is not None:
+    total_command = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    moving = total_command > command_threshold
+    cost = cost * torch.where(moving, moving_scale, 1.0)
+  return cost
+
+
+def action_smoothness_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Penalize the SECOND difference of the actions (a jerk proxy).
+
+  ``sum((a_t - 2 a_{t-1} + a_{t-2})^2)`` over the action dimensions.
+
+  Why this and not a larger ``action_rate_l2``. Both suppress high-frequency
+  content, but they weight it differently: a first difference has frequency
+  response ``4 sin^2(w/2)``, a second difference ``16 sin^4(w/2)``. The second
+  is far more concentrated at the top of the band, so it removes visible
+  twitch while leaving the smooth, fast action changes a swing leg legitimately
+  needs. Raising ``action_rate_l2`` instead damps the whole gait.
+
+  Measured motivation (run arm_robust_v4, iteration 12016): the second
+  difference averaged 0.423 per dimension with NO reward term acting on it --
+  it was logged as ``mean_action_acc`` and never penalized. Meanwhile 56% of
+  the ``action_rate_l2`` cost was exploration noise, which the deployed and
+  play-mode policies never emit because inference uses the distribution mean.
+  So the term that was paying for smoothness was mostly paying for something
+  invisible at deployment, and the quantity that actually reads as jitter was
+  unpriced.
+
+  Note the reset behaviour matches ``action_rate_l2``: the action history is
+  zeroed on reset, so the first step after a reset sees a full-magnitude
+  difference. That is pre-existing, identical for both terms, and washes out
+  over an episode.
+  """
+  acc = (
+    env.action_manager.action
+    - 2.0 * env.action_manager.prev_action
+    + env.action_manager.prev_prev_action
+  )
+  return torch.sum(torch.square(acc), dim=1)

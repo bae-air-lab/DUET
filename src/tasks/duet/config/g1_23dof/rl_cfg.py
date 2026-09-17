@@ -4,7 +4,9 @@ Two things differ from a stock mjlab PPO config, both of them defects fixed:
 
 - ``entropy_coef`` is not a hand-edited constant. It is produced by an
   :class:`EntropySchedule` that the runner evaluates every update and logs to
-  tfevents, so a fresh run and a resumed run use the same command line.
+  tfevents, so a fresh run and a resumed run use the same command line. The
+  schedule decays through the locomotion -> disturbance transition (see the
+  measurement note on ``entropy_schedule``).
 - ``symmetry_mode`` selects HOMIE contribution (c) without editing source.
 
 Everything a variant needs to change is an argument of
@@ -51,15 +53,28 @@ class DuetPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   entropy_schedule: dict | None = field(
     default_factory=lambda: {
       "high": 0.01,
-      # Floor raised 0.004 -> 0.006 on 2026-08-07. Across the 11 checkpoints
-      # measured after the curricula froze, tracking error CORRELATED POSITIVELY
-      # with iteration (yaw r = +0.52, vxy r = +0.43) and standing drift with it
-      # (r = +0.25) -- i.e. the policy kept sharpening against a fixed objective
-      # and slowly got worse. 0.004 let action std fall to 0.20; 0.006 keeps a
-      # little exploration alive so refinement does not become over-fitting.
-      "low": 0.006,
-      "hold_iters": CURRICULUM_END_ITERS,
-      "decay_iters": 2_000,
+      # Schedule inverted on 2026-09-15 (arm-robustness pass): high exploration
+      # DURING the stationary locomotion-foundation stage, low once disturbances
+      # ramp -- not "hold high until the curricula finish" as before.
+      # Measured in the first run with the old schedule (0.01 held to 7000):
+      # std bottomed at 0.216 at iteration ~1500, then rose monotonically to
+      # 0.72 by 5170 as pushes, arm motion and squat depth ramped; value loss
+      # 0.02 -> 0.54; return 101 -> 2. The action-rate penalty tracked the
+      # exploration-noise floor 13*2*std^2*0.1 to within ~13%, i.e. the policy
+      # was being charged almost entirely for its own noise. Mechanism: the
+      # entropy push on a scalar std is constant (coef*13/std) while the
+      # policy-gradient counter-force scales with how much of the advantage is
+      # explained by the noise; random pushes and unobserved arm goals add
+      # advantage variance the critic cannot remove, so the counter-force
+      # weakens exactly as the disturbances grow. Hence the coefficient must
+      # come DOWN as the task becomes stochastic. 0.01 was demonstrably fine
+      # while the task was stationary (std 0.22 at return 101).
+      # Previous floor note (2026-08-07): 0.004 let std fall to 0.20 on the
+      # old task and tracking slowly over-fit; 0.006 was chosen then. Under
+      # the new disturbance levels 0.004 is the floor that data supports.
+      "low": 0.004,
+      "hold_iters": 1_500,
+      "decay_iters": 1_000,
     }
   )
   """Two-stage entropy schedule; see ``EntropySchedule``. Set to ``None`` for a

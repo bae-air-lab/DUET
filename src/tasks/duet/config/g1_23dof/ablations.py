@@ -14,8 +14,11 @@ trains on it for a while.
 Variants
 --------
 Abl-Reference       full recipe (compressed curriculum), the control condition
-Abl-UniformArm      HOMIE (a), weakened: arm goals are 100% uniform workspace
-                    sampling instead of 70% deployment-pose anchors
+Abl-UniformArm      HOMIE (a): arm goals 100% uniform over the safe workspace.
+                    Since the arm-robustness pass this IS the reference recipe
+                    (the default arm_mode is "uniform"); the variant is kept so
+                    old result rows keep their name, and now measures nothing
+                    the reference does not
 Abl-NoArmCurriculum HOMIE (a), removed: arms pinned at the default pose, so the
                     lower body never sees an upper-body disturbance
 Abl-NoHeightCmd     HOMIE (b), removed: height pinned at 0.73; the observation
@@ -44,10 +47,9 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlOnPolicyRunnerCfg
 from mjlab.tasks.registry import register_mjlab_task
 
-from src.tasks.duet.duet_env_cfg import ITER
 from src.tasks.duet.rl import DuetOnPolicyRunner
 
-from .env_cfgs import unitree_g1_23dof_duet_flat_env_cfg
+from .env_cfgs import apply_duet_curriculum, unitree_g1_23dof_duet_flat_env_cfg
 from .rl_cfg import unitree_g1_23dof_duet_ppo_runner_cfg
 
 _ABL_END_ITERS = 3_500  # compressed curriculum saturation
@@ -64,31 +66,15 @@ _ABL_ENTROPY = {
 
 
 def _compress_curriculum(cfg: ManagerBasedRlEnvCfg) -> None:
-  """Halve every curriculum horizon (7k -> 3.5k iterations)."""
-  arm = cfg.actions["upper_body_pose"]
-  arm.ratio_curriculum_steps = _ABL_END_ITERS * ITER
-  cfg.commands["base_height"].floor_curriculum_steps = _ABL_END_ITERS * ITER
+  """Halve every curriculum horizon (7k -> 3.5k iterations).
+
+  Re-installs every staged schedule (command envelope, command mix, squat
+  floor, push magnitude, arm ratio / clean fraction) with all knots scaled by
+  3.5k / 7k, so the stages keep their relative timing.
+  """
   if "command_vel" not in cfg.curriculum:  # play mode clears the curriculum
     return
-  cfg.curriculum["command_vel"].params["velocity_stages"] = [
-    {
-      "step": 0,
-      "lin_vel_x": (-0.5, 1.0),
-      "lin_vel_y": (-0.4, 0.4),
-      "ang_vel_z": (-0.8, 0.8),
-    },
-    {
-      "step": 2_500 * ITER,
-      "lin_vel_x": (-0.8, 1.2),
-      "lin_vel_y": (-0.5, 0.5),
-      "ang_vel_z": (-1.0, 1.0),
-    },
-  ]
-  cfg.curriculum["command_mix"].params["stages"] = [
-    {"step": 0, "rel_standing_envs": 0.20, "walk_min_height": 0.71},
-    {"step": 2_000 * ITER, "rel_standing_envs": 0.30, "walk_min_height": 0.66},
-    {"step": _ABL_END_ITERS * ITER, "rel_standing_envs": 0.30, "walk_min_height": 0.60},
-  ]
+  apply_duet_curriculum(cfg, end_iters=_ABL_END_ITERS)
 
 
 # variant -> (env kwargs, ppo kwargs)

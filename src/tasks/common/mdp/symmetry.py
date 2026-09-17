@@ -19,6 +19,7 @@ Sagittal mirror = reflect y -> -y:
   - per-foot 3-vectors (contact force): swap feet + flip each y
   - joints: swap left<->right; flip roll/yaw DOFs (lateral), keep pitch/knee/elbow
   - height scan: reflect the ray grid about its own y axis (see below)
+  - arm_traj_vel (critic): joint rule over the arm joints only
 """
 
 from __future__ import annotations
@@ -122,6 +123,12 @@ def _group_perm_sign(env, group: str, jp: list[int], js: list[float]):
       p, s = jp[:dim], js[:dim]  # the lower-body action joints (first `dim`)
     elif name == "height_scan":
       p, s = _height_scan_perm(env, group, dim)
+    elif name == "arm_traj_vel":
+      # Per-arm-joint vector in the arm action term's joint order: same rule
+      # as the joint terms (swap left<->right, flip roll/yaw), restricted to
+      # the driven joints.
+      arm = env.unwrapped.action_manager.get_term("upper_body_pose")
+      p, s = _joint_perm_sign(list(arm.joint_names))
     elif name in _TERM_RULES:
       p, s = _TERM_RULES[name]
     else:

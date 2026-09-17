@@ -8,9 +8,29 @@ per-joint posture tolerances.
 Three HOMIE contributions, each independently ablatable via the arguments of
 :func:`unitree_g1_23dof_duet_rough_env_cfg`:
 
-  a. ``arm_mode``    -- upper-body pose curriculum (amplitude ramp + anchors)
+  a. ``arm_mode``    -- upper-body disturbance generator (trapezoidal
+                        trajectories over a safe workspace, curriculum-ramped)
   b. ``height_mode`` -- pelvis height as a first-class command
   c. symmetry        -- set on the runner, see ``rl_cfg.py``
+
+Training curriculum (arm-robustness pass). Every schedule below is a list of
+(iteration, value) knots installed by :func:`apply_duet_curriculum`; the
+stages overlap rather than isolate tasks:
+
+  A  0-1500     locomotion foundation: reduced command envelope, near-nominal
+                height, mild arm motion, ~10% pushes
+  B  1500-3000  arm disturbances begin: full basic command range, trapezoidal
+                arm trajectories opening up, height still near nominal
+  C  3000-5000  height variation: squat floor deepens, arm workspace and
+                dynamics keep growing, pushes at ~65%
+  D  5000-7000  approach the full task: full command range, full arm workspace /
+                velocity / acceleration, full pushes. The squat floor reaches
+                its final 0.27 m at 6000 and is constant thereafter.
+  E  7000+      full distribution, held fixed until the end of training
+
+A mixture runs throughout: a slice of envs (50% -> 10%) keeps mild arm motion
+and a slice of height commands (50% -> 10%) stays at the nominal height, so
+clean locomotion is never crowded out of the batch.
 
 Curriculum state note: every ramp here is keyed on ``env.common_step_counter``,
 which ``MjlabOnPolicyRunner`` writes into and restores from the checkpoint.
@@ -40,6 +60,15 @@ import src.tasks.duet.mdp as mdp
 from src.tasks.duet.duet_env_cfg import ITER, make_duet_env_cfg
 
 ##
+# Curriculum timing, sized for the 25k-iteration budget: every ramp saturates
+# at 7,000 iterations, leaving ~18k iterations of training on the full task
+# distribution. All knots below are written against this horizon and scaled
+# by ``apply_duet_curriculum`` when a shorter horizon is requested (ablations).
+##
+
+CURRICULUM_END_ITERS = 7_000
+
+##
 # Joint partition for the loco-manipulation carve-out.
 # The RL policy controls the lower body (12 legs + waist_yaw = 13 joints); the
 # arms (5 joints/side) are driven externally -- by the disturbance generator in
@@ -65,15 +94,6 @@ ARM_JOINTS = (
 _ARM_TOKENS = ("shoulder", "elbow", "wrist")
 
 ##
-# Curriculum timing, sized for the 25k-iteration budget: every ramp saturates
-# at 7,000 iterations, leaving ~18k iterations of training on the full task
-# distribution.
-##
-
-CURRICULUM_END_ITERS = 7_000
-_CURRICULUM_END_STEPS = CURRICULUM_END_ITERS * ITER
-
-##
 # Height command (HOMIE contribution b).
 ##
 
@@ -86,10 +106,120 @@ _CURRICULUM_END_STEPS = CURRICULUM_END_ITERS * ITER
 # reach -- which is why the policy learned to STOP chasing deep commands and
 # saturated around 0.22-0.25 m. 0.18 sits above the 0.144 limit with margin, so
 # the whole commanded range is achievable without pinning joints at their stops.
-# deploy.yaml base_height.range MUST match (updated in the same commit).
-HEIGHT_RANGE = (0.18, 0.73)
+#
+# Floor 0.27 -> 0.24 on 2026-09-16 (second pass). Measured by constrained
+# optimisation over the leg chain: the deepest pelvis height reachable with the
+# foot flat and EVERY joint strictly inside its soft limits is 0.204 m, and that
+# pose pins hip_pitch and ankle_pitch exactly at their stops. Allowing 0.10 rad
+# of margin gives 0.235 m, 0.20 rad gives 0.264 m. 0.24 keeps ~0.13 rad of
+# margin on the binding joints, so a commanded full-depth squat still has room
+# to reject a push without driving a joint into its stop (where the SDK clamps
+# the target and the motor holds a stall current). Deeper than ~0.22 is not
+# free: it trades that margin away. The previous floor is described below.
+#
+# Floor raised 0.18 -> 0.27 on 2026-09-16, on the operator's call, after the
+# arm-robustness run tracked the descending curriculum floor down to 0.27 m with
+# height error at or below 0.025 m the whole way -- deep enough for the intended
+# manipulation workspace. Height error made the first upward move of that run as
+# the ramp continued below 0.27 m, so the remaining depth was being bought at a
+# measurable cost in accuracy.
+#
+# This is the COMMAND range, not merely the curriculum floor, and the two MUST
+# agree: `build_deploy_metadata` records it as `height_command_range`, so
+# leaving 0.18 here while training only to 0.27 would make the exported ONNX
+# claim a trained depth the policy never saw, and would let
+# `check_deploy_consistency.py` pass a deploy.yaml permitting an untrained
+# command. Expect a consequence: deploy.yaml still carries [0.18, 0.73] for the
+# PREVIOUSLY deployed checkpoint, so the checker now fails its
+# "base_height range within trained range" test until that file is narrowed to
+# [0.27, 0.73] alongside a policy exported from this run. That failure is the
+# mechanism working, not a regression.
+HEIGHT_RANGE = (0.24, 0.73)
 WALK_MIN_HEIGHT_FINAL = 0.60  # walking is restricted to >= 0.60 m
-_SQUAT_FLOOR_START = 0.45  # squat depth ramps 0.45 -> 0.18
+
+# Squat-floor schedule, (iteration, floor m): near-nominal through the
+# locomotion + arm-introduction stages, then deepening to HEIGHT_RANGE[0].
+# The final knot sits at 6000, not 7000, because that is where the frozen run
+# resumes; `piecewise_linear` holds the last value for every later step, so
+# nothing re-deepens the floor afterwards.
+SQUAT_FLOOR_STAGES = (
+  (0, 0.68), (1_500, 0.68), (3_000, 0.60), (5_000, 0.38), (6_000, HEIGHT_RANGE[0])
+)
+
+# Velocity command envelope, staged (iteration -> ranges). Stage A is a
+# reduced envelope so the newborn policy learns stand / walk / strafe / turn /
+# stop before speed; the final stage is HOMIE's range with yaw widened to +-1.0
+# to cover deploy.yaml's joystick mapping.
+VELOCITY_STAGES = (
+  (0, {"lin_vel_x": (-0.3, 0.6), "lin_vel_y": (-0.2, 0.2), "ang_vel_z": (-0.4, 0.4)}),
+  (1_500, {"lin_vel_x": (-0.5, 1.0), "lin_vel_y": (-0.4, 0.4), "ang_vel_z": (-0.8, 0.8)}),
+  (3_500, {"lin_vel_x": (-0.75, 1.0), "lin_vel_y": (-0.45, 0.45), "ang_vel_z": (-0.9, 0.9)}),
+  # Final range made SYMMETRIC in x on 2026-09-16 (was -0.8..1.2). Measured on
+  # model_19000, backward tracking was short at every speed while forward was
+  # near exact: at |0.2| the robot managed 0.285 forward but only 0.104 back,
+  # and every one of the nine sweep errors pointed forward. An asymmetric range
+  # trains the two directions unequally for no operational gain -- deploy.yaml
+  # clamps the joystick to +-0.5, so the old 1.2 ceiling was never commanded on
+  # the robot while the -0.8 floor was the binding one.
+  (5_000, {"lin_vel_x": (-1.0, 1.0), "lin_vel_y": (-0.5, 0.5), "ang_vel_z": (-1.0, 1.0)}),
+)
+VELOCITY_FINAL = VELOCITY_STAGES[-1][1]
+# Each stage above is blended in over this many iterations rather than switched
+# at once (see ``curriculums.commands_vel``): the one-iteration doubling of the
+# envelope at 1500 was where the first run's action-std runaway began.
+VELOCITY_RAMP_ITERS = 500
+
+# Command mixture, staged: standing fraction, walk-band floor, and the
+# nominal-height slice (mixture curriculum, height half).
+COMMAND_MIX_STAGES = (
+  (0, {"rel_standing_envs": 0.20, "walk_min_height": 0.71, "nominal_height_fraction": 0.50}),
+  (1_500, {"rel_standing_envs": 0.25, "walk_min_height": 0.71, "nominal_height_fraction": 0.40}),
+  (3_000, {"rel_standing_envs": 0.30, "walk_min_height": 0.68, "nominal_height_fraction": 0.30}),
+  (5_000, {"rel_standing_envs": 0.30, "walk_min_height": 0.64, "nominal_height_fraction": 0.20}),
+  (7_000, {"rel_standing_envs": 0.30, "walk_min_height": WALK_MIN_HEIGHT_FINAL, "nominal_height_fraction": 0.10}),
+)
+
+# Push magnitude as a fraction of the final ``push_robot`` velocity range.
+PUSH_SCALE_STAGES = ((0, 0.10), (1_000, 0.30), (3_000, 0.65), (5_000, 1.0))
+
+##
+# Arm disturbance generator (see ``mdp.UpperBodyPoseActionCfg``).
+##
+
+# Safe joint workspace (rad) for INDEPENDENT per-joint sampling. A conservative
+# box inside the soft limits chosen so that any combination is mechanically
+# reasonable: shoulder roll never swings the arm through the torso, yaw and
+# elbow are kept short of the range where a bent forearm sweeps the chest.
+# Sign conventions: negative shoulder pitch raises the arm forward/up (default
+# hang 0.35); positive left / negative right shoulder roll abducts outward
+# (defaults +-0.18); elbow default 0.87. Arm-arm contact in rare combinations
+# (both arms far forward with inward yaw) is still possible and is tolerated:
+# the self-collision term only flags hard (>50 N) contacts.
+ARM_WORKSPACE_LIMITS = {
+  r".*_shoulder_pitch_joint": (-2.0, 1.0),  # high reach ... hand behind hip
+  "left_shoulder_roll_joint": (-0.25, 1.6),
+  "right_shoulder_roll_joint": (-1.6, 0.25),
+  r".*_shoulder_yaw_joint": (-1.0, 1.0),
+  r".*_elbow_joint": (-0.5, 1.6),
+  r".*_wrist_roll_joint": (-1.5, 1.5),
+}
+
+# Final trajectory dynamics (per joint, per segment, sampled uniformly).
+# vmax up to 3.5 rad/s and amax up to 20 rad/s^2 cover a fast VLA / teleop
+# motion with margin; the initial ranges are what stage A trains against.
+ARM_TRAJ_VMAX_RANGE = (0.3, 3.5)  # rad/s
+ARM_TRAJ_VMAX_RANGE_INIT = (0.2, 0.8)
+ARM_TRAJ_AMAX_RANGE = (1.0, 20.0)  # rad/s^2
+ARM_TRAJ_AMAX_RANGE_INIT = (0.5, 3.0)
+ARM_TARGET_HOLD_RANGE = (0.2, 2.5)  # s
+ARM_WORKSPACE_SCALE = 1.0  # fraction of ARM_WORKSPACE_LIMITS at full curriculum
+
+# Curriculum ratio (iteration, ratio): scales the workspace and interpolates
+# the dynamics ranges from _INIT to final. Stage A keeps it small.
+ARM_RATIO_STAGES = ((0, 0.15), (1_500, 0.15), (3_000, 0.50), (5_000, 0.75), (7_000, 1.0))
+# Mixture curriculum, arm half: fraction of envs held at the mild "clean" ratio.
+ARM_CLEAN_FRACTION_STAGES = ((0, 0.50), (1_500, 0.40), (3_000, 0.30), (5_000, 0.20), (7_000, 0.10))
+ARM_CLEAN_ENV_RATIO = 0.10
 
 ##
 # Payload. See documents/duet/reward_design.md section 2.
@@ -131,9 +261,12 @@ def _arm_pose(
   }
 
 
-# Deployment-pose anchors for the arm curriculum. Signs: negative shoulder pitch
-# raises the arm forward/up; default hang is pitch 0.35, elbow 0.87, roll +-0.18.
-# These are the poses the VLA will actually hold at deployment.
+# Deployment-pose anchors. Signs: negative shoulder pitch raises the arm
+# forward/up; default hang is pitch 0.35, elbow 0.87, roll +-0.18. Used by
+# ``arm_mode="anchored"`` as a MINORITY of goal draws and by the evaluation
+# probes (``scripts/duet_probe_idle.py``, ``scripts/duet_arm_scenarios.py``)
+# as static test poses. The default task distribution is uniform over
+# ``ARM_WORKSPACE_LIMITS`` so the policy is not biased toward these.
 TASK_ARM_POSES = (
   _arm_pose(pitch=-0.10, roll=0.10, yaw=0.0, elbow=1.20),  # box carry at waist
   _arm_pose(pitch=-0.50, roll=0.12, yaw=0.0, elbow=1.00),  # box carry at chest
@@ -154,10 +287,103 @@ TASK_ARM_POSE_NOISE = {
 }
 
 
+def apply_duet_curriculum(
+  cfg: ManagerBasedRlEnvCfg, end_iters: int = CURRICULUM_END_ITERS
+) -> None:
+  """Install every staged schedule, scaled so all ramps saturate at ``end_iters``.
+
+  The knots at module level are written against the 7,000-iteration horizon;
+  a shorter horizon (ablations) scales every knot's iteration by the same
+  factor so the stages keep their relative timing. Curriculum state is read
+  from ``env.common_step_counter``, which is checkpointed, so resuming
+  continues every ramp where it stopped.
+  """
+  f = end_iters / CURRICULUM_END_ITERS
+
+  def it(iters: float) -> int:
+    return int(round(iters * f)) * ITER
+
+  arm = cfg.actions["upper_body_pose"]
+  assert isinstance(arm, mdp.UpperBodyPoseActionCfg)
+  arm.ratio_stages = tuple((it(i), r) for i, r in ARM_RATIO_STAGES)
+  arm.clean_fraction_stages = tuple((it(i), r) for i, r in ARM_CLEAN_FRACTION_STAGES)
+
+  base_height_cmd = cfg.commands["base_height"]
+  assert isinstance(base_height_cmd, mdp.BaseHeightCommandCfg)
+  base_height_cmd.floor_curriculum_start = SQUAT_FLOOR_STAGES[0][1]
+  base_height_cmd.floor_curriculum_steps = it(CURRICULUM_END_ITERS)
+  base_height_cmd.floor_stages = tuple((it(i), h) for i, h in SQUAT_FLOOR_STAGES)
+  base_height_cmd.walk_min_height = COMMAND_MIX_STAGES[0][1]["walk_min_height"]
+  base_height_cmd.nominal_env_fraction = COMMAND_MIX_STAGES[0][1][
+    "nominal_height_fraction"
+  ]
+
+  twist_cmd = cfg.commands["twist"]
+  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
+  twist_cmd.rel_standing_envs = COMMAND_MIX_STAGES[0][1]["rel_standing_envs"]
+  for axis, rng in VELOCITY_STAGES[0][1].items():
+    setattr(twist_cmd.ranges, axis, rng)
+
+  cfg.curriculum["command_vel"] = CurriculumTermCfg(
+    func=mdp.commands_vel,
+    params={
+      "command_name": "twist",
+      "velocity_stages": [{"step": it(i), **r} for i, r in VELOCITY_STAGES],
+      "ramp_steps": it(VELOCITY_RAMP_ITERS),
+    },
+  )
+  cfg.curriculum["command_mix"] = CurriculumTermCfg(
+    func=mdp.command_mix,
+    params={
+      "twist_command_name": "twist",
+      "height_command_name": "base_height",
+      "stages": [{"step": it(i), **r} for i, r in COMMAND_MIX_STAGES],
+    },
+  )
+  cfg.curriculum["push_magnitude"] = CurriculumTermCfg(
+    func=mdp.push_magnitude,
+    params={
+      "event_name": "push_robot",
+      "base_velocity_range": dict(cfg.events["push_robot"].params["velocity_range"]),
+      "scale_stages": [(it(i), s) for i, s in PUSH_SCALE_STAGES],
+    },
+  )
+  # Log-only: surfaces the arm generator's ratio on the training curves.
+  cfg.curriculum["arm_curriculum_state"] = CurriculumTermCfg(
+    func=mdp.arm_curriculum_state, params={"action_term_name": "upper_body_pose"}
+  )
+  # The push event keeps its FULL range in the cfg. The curriculum manager runs
+  # on every reset, including the initial env.reset(), so the stage-0 scale is
+  # applied before the first push can fire (interval >= 3 s); and any
+  # evaluation script that clears ``cfg.curriculum`` gets full pushes, as before.
+
+
+def pin_duet_full_distribution(cfg: ManagerBasedRlEnvCfg) -> None:
+  """No staging: sample the final (hardest) task distribution from step 0."""
+  arm = cfg.actions["upper_body_pose"]
+  assert isinstance(arm, mdp.UpperBodyPoseActionCfg)
+  arm.init_ratio = 1.0
+  arm.clean_fraction_stages = ((0, ARM_CLEAN_FRACTION_STAGES[-1][1]),)
+  base_height_cmd = cfg.commands["base_height"]
+  assert isinstance(base_height_cmd, mdp.BaseHeightCommandCfg)
+  base_height_cmd.floor_curriculum_start = HEIGHT_RANGE[0]
+  base_height_cmd.floor_stages = None
+  final_mix = COMMAND_MIX_STAGES[-1][1]
+  base_height_cmd.walk_min_height = final_mix["walk_min_height"]
+  base_height_cmd.nominal_env_fraction = final_mix["nominal_height_fraction"]
+  twist_cmd = cfg.commands["twist"]
+  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
+  twist_cmd.rel_standing_envs = final_mix["rel_standing_envs"]
+  for axis, rng in VELOCITY_FINAL.items():
+    setattr(twist_cmd.ranges, axis, rng)
+  for name in ("command_vel", "command_mix", "push_magnitude", "arm_curriculum_state"):
+    cfg.curriculum.pop(name, None)
+
+
 def unitree_g1_23dof_duet_rough_env_cfg(
   play: bool = False,
   deploy_gains: bool = False,
-  arm_mode: str = "anchored",
+  arm_mode: str = "uniform",
   height_mode: str = "command",
   payload: bool = True,
   command_curriculum: bool = True,
@@ -173,8 +399,10 @@ def unitree_g1_23dof_duet_rough_env_cfg(
       of the soft first-principles gains. Checkpoints do NOT transfer between
       the two; the exported deploy.yaml must carry the matching table.
     arm_mode: HOMIE contribution (a) ablation.
-      ``anchored`` -- 70% deployment-pose anchors + 30% uniform (default).
-      ``uniform``  -- 100% uniform workspace sampling.
+      ``uniform``  -- goals sampled uniformly and independently per joint over
+                      the safe workspace (default; VLA-agnostic).
+      ``anchored`` -- as uniform, but 20% of goals are deployment-pose anchors
+                      plus independent per-joint noise.
       ``off``      -- arms pinned at the default pose; no upper-body disturbance.
     height_mode: HOMIE contribution (b) ablation.
       ``command`` -- pelvis height sampled in [0.12, 0.73] (default).
@@ -252,19 +480,32 @@ def unitree_g1_23dof_duet_rough_env_cfg(
       if not any(tok in k for tok in _ARM_TOKENS)
     }
 
-  # HOMIE contribution (a): the upper-body pose curriculum. Consumes ZERO
+  # HOMIE contribution (a): the upper-body disturbance generator. Consumes ZERO
   # policy action dimensions -- it only writes joint targets for the arms.
+  # Per-env asynchronous trapezoidal trajectories between independently
+  # sampled left/right goals; NO slow-down while walking (the deployed VLA does
+  # not know the legs are walking, so the policy must not train as if it did).
+  # Stage timing is installed by ``apply_duet_curriculum`` below.
   if arm_mode not in ("anchored", "uniform", "off"):
     raise ValueError(f"arm_mode must be anchored|uniform|off, got {arm_mode!r}")
   cfg.actions["upper_body_pose"] = mdp.UpperBodyPoseActionCfg(
     entity_name="robot",
     joint_names=ARM_JOINTS,
     enabled=arm_mode != "off",
-    sample_range_scale=0.5,
+    workspace_limits=ARM_WORKSPACE_LIMITS,
+    sample_range_scale=ARM_WORKSPACE_SCALE,
+    traj_vmax_range=ARM_TRAJ_VMAX_RANGE,
+    traj_vmax_range_init=ARM_TRAJ_VMAX_RANGE_INIT,
+    traj_amax_range=ARM_TRAJ_AMAX_RANGE,
+    traj_amax_range_init=ARM_TRAJ_AMAX_RANGE_INIT,
+    hold_prob=0.5,
+    hold_time_range=ARM_TARGET_HOLD_RANGE,
+    stationary_arm_prob=0.2,
+    max_segment_time=8.0,
+    clean_env_ratio=ARM_CLEAN_ENV_RATIO,
     task_poses=TASK_ARM_POSES,
-    task_pose_prob=0.7 if arm_mode == "anchored" else 0.0,
+    task_pose_prob=0.2 if arm_mode == "anchored" else 0.0,
     task_pose_noise=TASK_ARM_POSE_NOISE,
-    ratio_curriculum_steps=_CURRICULUM_END_STEPS,
   )
 
   cfg.viewer.body_name = "torso_link"
@@ -278,16 +519,14 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   twist_cmd.viz.z_offset = 1.15
 
   # HOMIE contribution (b). Range matches deploy.yaml exactly; the squat floor
-  # ramps 0.45 -> 0.12 so the policy masters shallow squats before deep ones.
+  # follows SQUAT_FLOOR_STAGES (installed by apply_duet_curriculum) so the
+  # policy masters shallow squats before deep ones.
   if height_mode not in ("command", "fixed"):
     raise ValueError(f"height_mode must be command|fixed, got {height_mode!r}")
   base_height_cmd = cfg.commands["base_height"]
   assert isinstance(base_height_cmd, mdp.BaseHeightCommandCfg)
   base_height_cmd.enabled = height_mode == "command"
   base_height_cmd.height_range = HEIGHT_RANGE
-  base_height_cmd.walk_min_height = 0.71  # lowered to 0.60 by command_mix
-  base_height_cmd.floor_curriculum_start = _SQUAT_FLOOR_START
-  base_height_cmd.floor_curriculum_steps = _CURRICULUM_END_STEPS
 
   cfg.observations["critic"].terms["foot_height"].params[
     "asset_cfg"
@@ -368,10 +607,24 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   # Loose on the squat joints so a commanded squat is not fought; tight on the
   # lateral/yaw joints, which are what balance depends on. Squat depth is driven
   # by track_base_height, never by posture regularisation.
+  # Sagittal tolerances loosened 2x on 2026-09-16 (0.8/0.8/0.4 -> 1.6/1.6/0.8).
+  # Why: the DEFAULT joint pose is 0.786 m tall, which is ABOVE the top of the
+  # height command range (0.73). At the top of the range the pose regulariser
+  # and track_base_height therefore want different things, and at the old
+  # tolerances the regulariser won: measured on model_11500, a 0.73 command
+  # settled at 0.786 m (pose 0.969, height 1.477) instead of folding to 0.71
+  # (pose 0.761, height 2.000, minus ~0.38 of extra idle-anchor and torso
+  # cost that holding a squat incurs). The tall pose won by 0.053/s, and that
+  # thin margin also made commands near 0.68 bistable -- a 13 cm jump between
+  # a 0.67 and a 0.69 command, with everything in 0.66..0.72 unreachable.
+  # At 1.6/1.6/0.8 the same arithmetic favours tracking by 0.117/s.
+  # Only STANDING is touched: std_walking and std_running are unchanged, so
+  # gait regularisation is unaffected, and the lateral/yaw joints stay tight
+  # at 0.05 because they are what balance depends on.
   cfg.rewards["pose"].params["std_standing"] = {
-    r".*hip_pitch.*": 0.8,
-    r".*knee.*": 0.8,
-    r".*ankle_pitch.*": 0.4,
+    r".*hip_pitch.*": 1.6,
+    r".*knee.*": 1.6,
+    r".*ankle_pitch.*": 0.8,
     r".*hip_roll.*": 0.05,
     r".*hip_yaw.*": 0.05,
     r".*ankle_roll.*": 0.05,
@@ -417,8 +670,13 @@ def unitree_g1_23dof_duet_rough_env_cfg(
     "foot_clearance",
     "foot_slip",
     "idle_feet_still",
+    "com_support",
   ):
     cfg.rewards[name].params["asset_cfg"].site_names = site_names
+  for name in ("torso_pitch_abs", "torso_roll_abs"):
+    cfg.metrics[name].params["asset_cfg"].body_names = ("torso_link",)
+  for name in ("com_support_error", "foot_slip_speed", "height_track_error"):
+    cfg.metrics[name].params["asset_cfg"].site_names = site_names
 
   # Idle-precision group, added after hardware testing showed the standing base
   # drifting -- markedly worse with the arms extended forward, which shifts the
@@ -435,61 +693,31 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   ##
 
   if command_curriculum:
-    cfg.curriculum["command_vel"] = CurriculumTermCfg(
-      func=mdp.commands_vel,
-      params={
-        "command_name": "twist",
-        "velocity_stages": [
-          {
-            "step": 0,
-            "lin_vel_x": (-0.5, 1.0),
-            "lin_vel_y": (-0.4, 0.4),
-            "ang_vel_z": (-0.8, 0.8),
-          },
-          {
-            # HOMIE's own command range, except yaw widened to +-1.0 to cover
-            # deploy.yaml's joystick mapping. The trained range is a strict
-            # superset of the commanded range, so deployment never extrapolates.
-            "step": 5_000 * ITER,
-            "lin_vel_x": (-0.8, 1.2),
-            "lin_vel_y": (-0.5, 0.5),
-            "ang_vel_z": (-1.0, 1.0),
-          },
-        ],
-      },
-    )
-    # Curriculum by command DISTRIBUTION: walk-dominant near nominal height
-    # first, then standing squats, finally squat-while-walking.
-    cfg.curriculum["command_mix"] = CurriculumTermCfg(
-      func=mdp.command_mix,
-      params={
-        "twist_command_name": "twist",
-        "height_command_name": "base_height",
-        "stages": [
-          {"step": 0, "rel_standing_envs": 0.20, "walk_min_height": 0.71},
-          {"step": 4_000 * ITER, "rel_standing_envs": 0.30, "walk_min_height": 0.66},
-          {
-            "step": _CURRICULUM_END_STEPS,
-            "rel_standing_envs": 0.30,
-            "walk_min_height": WALK_MIN_HEIGHT_FINAL,
-          },
-        ],
-      },
-    )
+    apply_duet_curriculum(cfg, CURRICULUM_END_ITERS)
   else:
     # Ablation: no staging. Sample the final distribution from step 0.
-    twist_cmd.rel_standing_envs = 0.30
-    twist_cmd.ranges.lin_vel_x = (-0.8, 1.2)
-    twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
-    twist_cmd.ranges.ang_vel_z = (-1.0, 1.0)
-    base_height_cmd.walk_min_height = WALK_MIN_HEIGHT_FINAL
-    base_height_cmd.floor_curriculum_start = HEIGHT_RANGE[0]
+    pin_duet_full_distribution(cfg)
 
   if play:
     cfg.episode_length_s = int(1e9)
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.curriculum = {}
+    # Play: arms static at the default pose (a fresh process starts at step 0;
+    # the probes and the squat/idle scripts rely on this). Scenario tests that
+    # need arm motion drive the term explicitly, see
+    # ``scripts/duet_arm_scenarios.py``.
+    arm_cfg = cfg.actions["upper_body_pose"]
+    assert isinstance(arm_cfg, mdp.UpperBodyPoseActionCfg)
+    arm_cfg.init_ratio = 0.0
+    arm_cfg.ratio_stages = ((0, 0.0),)
+    arm_cfg.clean_fraction_stages = ((0, 0.0),)
+    twist_cmd.ranges.lin_vel_x = VELOCITY_FINAL["lin_vel_x"]
+    twist_cmd.ranges.lin_vel_y = VELOCITY_FINAL["lin_vel_y"]
+    twist_cmd.ranges.ang_vel_z = VELOCITY_FINAL["ang_vel_z"]
+    base_height_cmd.floor_curriculum_start = HEIGHT_RANGE[0]  # full depth
+    base_height_cmd.walk_min_height = WALK_MIN_HEIGHT_FINAL
+    base_height_cmd.nominal_env_fraction = 0.0
     cfg.events["randomize_terrain"] = EventTermCfg(
       func=envs_mdp.randomize_terrain, mode="reset", params={}
     )

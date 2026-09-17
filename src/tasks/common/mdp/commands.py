@@ -54,6 +54,21 @@ class BaseHeightCommandCfg(CommandTermCfg):
   floor_curriculum_start: float = 0.45
   floor_curriculum_steps: int = 100_000
 
+  # Staged alternative to the linear ramp: (policy_step, floor) knots, linearly
+  # interpolated (see ``curriculums.piecewise_linear``). When set it replaces
+  # the ``floor_curriculum_start/steps`` ramp, EXCEPT that setting
+  # ``floor_curriculum_start <= height_range[0]`` still pins the floor at full
+  # depth -- that is how the evaluation protocol pins the curriculum, and it
+  # must keep working.
+  floor_stages: tuple[tuple[int, float], ...] | None = None
+
+  # Mixture curriculum (height half): fraction of envs whose height command is
+  # pinned at the nominal standing height ``height_range[1]`` at resample time.
+  # Driven over training by ``curriculums.command_mix``; keeps a slice of
+  # nominal-height envs alive so height randomisation never crowds out plain
+  # standing/walking.
+  nominal_env_fraction: float = 0.0
+
   def build(self, env: ManagerBasedRlEnv) -> BaseHeightCommand:
     return BaseHeightCommand(self, env)
 
@@ -97,6 +112,12 @@ class BaseHeightCommand(CommandTerm):
     """Squat floor at the current training step (ramps start -> height_range[0])."""
     lo = self.cfg.height_range[0]
     start = self.cfg.floor_curriculum_start
+    if start <= lo:
+      return lo  # pinned at full depth (evaluation / no-curriculum ablation)
+    if self.cfg.floor_stages:
+      from .curriculums import piecewise_linear
+
+      return max(lo, piecewise_linear(self._step_count, self.cfg.floor_stages))
     frac = min(1.0, self._step_count / max(self.cfg.floor_curriculum_steps, 1))
     return start + frac * (lo - start)
 
@@ -115,6 +136,18 @@ class BaseHeightCommand(CommandTerm):
     self._walk_target[env_ids] = torch.empty(n, 1, device=self.device).uniform_(
       self.cfg.walk_min_height, hi
     )
+    # Mixture slice: some envs stay at the nominal height for the whole
+    # command window (both regimes), whatever the curriculum floor is.
+    if self.cfg.nominal_env_fraction > 0.0:
+      nominal = (
+        torch.rand(n, 1, device=self.device) < self.cfg.nominal_env_fraction
+      )
+      self._squat_target[env_ids] = torch.where(
+        nominal, torch.full_like(nominal, hi, dtype=torch.float), self._squat_target[env_ids]
+      )
+      self._walk_target[env_ids] = torch.where(
+        nominal, torch.full_like(nominal, hi, dtype=torch.float), self._walk_target[env_ids]
+      )
 
   def _update_command(self) -> None:
     # Moving -> walk-band height; (near) standing -> squat target (full depth).
