@@ -310,10 +310,14 @@ RB_DELAY_MAX_LAG = 4
 RB_DELAY_UPDATE_PERIOD = 1_000_000_000
 
 # Task-success terrain curriculum thresholds (mdp.terrain_levels_task).
+# Relaxed once (brief section 9), 2026-09-30 at iteration 3000 of the H5 run
+# 2026-09-30_00-17-59_rough_blind_tall_h5: terrain_level_mean was 0.00 with no
+# promotion since the start (episode means lin 0.41 m/s, yaw 0.90 rad/s at
+# 2000). Was lin 0.20 / yaw 0.35.
 RB_TERRAIN_PROMOTE = {
   "min_moving_fraction": 0.25,
-  "max_lin_vel_error": 0.20,
-  "max_yaw_error": 0.35,
+  "max_lin_vel_error": 0.25,
+  "max_yaw_error": 0.45,
   "max_height_error": 0.04,
   "max_idle_drift": 0.05,
 }

@@ -443,3 +443,25 @@ The only difference from the brief's commands, apart from B waiting, is the
 `grep -v ccd_iterations` filter (8.9). TensorBoard:
 `conda activate duet && tensorboard --logdir ~/Desktop/DUET/logs/rsl_rl/DUET_G1_23dof --port 6006 --bind_all`.
 Runs also sync to wandb (project `mjlab`), the configured default.
+
+### 8.12 Terrain promote thresholds relaxed once (2026-09-30, iteration 3000)
+
+Section-9 rule: `terrain_level_mean` below 1.0 at iteration 3000 -> relax the
+promote thresholds once to lin 0.25 / yaw 0.45, resume. H5 run
+`2026-09-30_00-17-59_rough_blind_tall_h5` at iteration 3010: terrain level
+0.00, no env promoted since the start (promote_frac 0.000 throughout; demote
+0.65 of resetting envs), with otherwise healthy training (action std 0.257,
+falls 8% of episodes over the last 500 iterations, height error 0.028 m,
+reward 55.5). At iteration 2000 the episode means were lin 0.41 m/s, yaw 0.90
+rad/s, height 0.024 m, idle drift 0.059 m against promote limits 0.20 / 0.35 /
+0.04 / 0.05.
+
+Change: `RB_TERRAIN_PROMOTE` lin 0.20 -> 0.25, yaw 0.35 -> 0.45 (height, drift,
+moving fraction and the demote rule unchanged). The run was stopped with Ctrl-C
+right after `model_3000.pt` was written and resumed from it
+(`--agent.resume True --agent.load-run 2026-09-30_00-17-59_rough_blind_tall_h5
+--agent.load-checkpoint model_3000.pt --agent.max-iterations 22001`, ending at
+25000) into a new run directory with the same run name; the console log is
+appended. Terrain levels are not checkpointed and restart at random rows 0-5
+on resume. Run B (H1) had not started, so it trains with the relaxed thresholds
+from iteration 0: A and B now also differ in this for A's first 3000 iterations.
