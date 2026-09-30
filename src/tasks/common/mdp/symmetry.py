@@ -20,6 +20,14 @@ Sagittal mirror = reflect y -> -y:
   - joints: swap left<->right; flip roll/yaw DOFs (lateral), keep pitch/knee/elbow
   - height scan: reflect the ray grid about its own y axis (see below)
   - arm_traj_vel (critic): joint rule over the arm joints only
+  - foot_friction_coef (critic): one scalar shared by both feet -> unchanged
+  - foot_softness (critic): [left, right] -> swapped
+
+History. With ``history_length = H`` on a group, each term's width is ``D*H``,
+laid out per term with the H frames of that term oldest to newest (mjlab's
+``CircularBuffer.buffer``, flattened). Every per-frame rule above is tiled over
+the frames: ``perm = [h*D + p for h in range(H) for p in rule]``, signs repeated
+H times, so a frame is only ever mirrored into the same frame.
 """
 
 from __future__ import annotations
@@ -47,6 +55,8 @@ _TERM_RULES: dict[str, tuple[list[int], list[float]]] = {
   "foot_contact": ([1, 0], [1.0, 1.0]),
   "foot_contact_forces": ([3, 4, 5, 0, 1, 2], [1.0, -1.0, 1.0, 1.0, -1.0, 1.0]),
   "height_command": ([0], [1.0]),
+  "foot_friction_coef": ([0], [1.0]),
+  "foot_softness": ([1, 0], [1.0, 1.0]),
 }
 
 # Caches keyed by env id: action perm/sign (no obs needed) and per-group perm/sign.
@@ -109,14 +119,26 @@ def _height_scan_perm(env, group: str, dim: int) -> tuple[list[int], list[float]
   return perm, [1.0] * dim  # terrain height is a scalar, unchanged by reflection
 
 
+def _group_history_length(om, group: str) -> int:
+  """Frames per term in ``group``, from the group config (1 when unset or 0)."""
+  return max(1, int(om.cfg[group].history_length or 1))
+
+
 def _group_perm_sign(env, group: str, jp: list[int], js: list[float]):
   om = env.unwrapped.observation_manager
   names = om.active_terms[group]
+  hist = _group_history_length(om, group)
   dims = [d[0] for d in om.group_obs_term_dim[group]]
   flat_perm: list[int] = []
   flat_sign: list[float] = []
   off = 0
-  for name, dim in zip(names, dims, strict=True):
+  for name, width in zip(names, dims, strict=True):
+    if width % hist:
+      raise ValueError(
+        f"symmetry: term '{name}' width {width} is not a multiple of the "
+        f"group history length {hist}"
+      )
+    dim = width // hist  # per-frame width
     if name in ("joint_pos", "joint_vel"):
       p, s = jp, js
     elif name == "actions":
@@ -135,9 +157,9 @@ def _group_perm_sign(env, group: str, jp: list[int], js: list[float]):
       raise KeyError(f"symmetry: no mirror rule for obs term '{name}'")
     if len(p) != dim:
       raise ValueError(f"symmetry: term '{name}' rule len {len(p)} != obs dim {dim}")
-    flat_perm += [off + pi for pi in p]
-    flat_sign += list(s)
-    off += dim
+    flat_perm += [off + h * dim + pi for h in range(hist) for pi in p]
+    flat_sign += list(s) * hist
+    off += width
   dev = env.unwrapped.device
   return (
     torch.tensor(flat_perm, dtype=torch.long, device=dev),

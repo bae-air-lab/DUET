@@ -17,6 +17,14 @@ payload numbers, is in [`documents/duet/reward_design.md`](../../../documents/du
 | `Unitree-G1-23Dof-Duet-Rough` | rough terrain (adds `height_scan`, 258-D obs — not deployable) |
 | `Unitree-G1-23Dof-Duet-Flat-DeployGains` | A/B against the unitree_rl_gym gain table |
 | `Unitree-G1-23Dof-Duet-Abl-*` | 10 matched-budget ablations, one variable each |
+| `Unitree-G1-23Dof-Duet-RoughBlind-Tall-H5` | blind policy for poultry litter: litter terrain, soft/slippery feet, PD-gain and latency randomisation, nominal height 0.79 m; actor sees 5 frames of the 71-D obs (355-D, deploy.yaml `history_length: 5` on every term) |
+| `Unitree-G1-23Dof-Duet-RoughBlind-Tall` | the same with 1 frame: drop-in 71-D `-Flat` interface (fallback, and the history ablation) |
+| `...-RoughBlind-Tall[-H5]-EvalFlat` | fixed evaluation: plane, rigid contacts, play settings |
+| `...-RoughBlind-Tall[-H5]-EvalLitter` | fixed evaluation: litter at difficulty 0.8-1.0, softest feet, friction 0.3 |
+
+The rough-blind-tall tasks, their measured constants and deploy files are
+described in [`documents/duet/arm_robustness.md`](../../../documents/duet/arm_robustness.md)
+section 8.
 
 ## Train
 

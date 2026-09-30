@@ -91,8 +91,16 @@ def build_deploy_metadata(
       return _round(x[0].cpu().tolist())
     return _round([float(x)] * n)
 
-  obs_names = list(env.observation_manager.active_terms["actor"])
-  obs_dims = [int(d[0]) for d in env.observation_manager.group_obs_term_dim["actor"]]
+  # With actor history H, mjlab reports each term's width as D*H (the term's H
+  # frames, oldest first, then the next term). The contract records per-FRAME
+  # widths -- what deploy.yaml's per-term ``scale`` lists describe -- plus H;
+  # obs_dim stays the full ONNX input width, sum(widths) * H.
+  om = env.observation_manager
+  history = max(1, int(om.cfg["actor"].history_length or 1))
+  obs_names = list(om.active_terms["actor"])
+  full_dims = [int(d[0]) for d in om.group_obs_term_dim["actor"]]
+  assert all(d % history == 0 for d in full_dims), (full_dims, history)
+  obs_dims = [d // history for d in full_dims]
 
   metadata: dict[str, list | str | float] = {
     "run_path": run_path,
@@ -110,7 +118,11 @@ def build_deploy_metadata(
     # -- observation contract -------------------------------------------------
     "observation_names": obs_names,
     "observation_dims": obs_dims,
-    "obs_dim": int(sum(obs_dims)),
+    "obs_dim": int(sum(full_dims)),
+    # Not in SAFETY_CRITICAL_FIELDS: obs_dim together with observation_dims
+    # already fixes it, and leaving it out keeps the hash of every 1-frame
+    # export identical to what it was before history existed.
+    "history_length": history,
     "command_names": list(env.command_manager.active_terms),
     "step_dt": round(float(env.step_dt), 6),
   }

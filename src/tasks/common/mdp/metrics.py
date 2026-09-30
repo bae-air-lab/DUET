@@ -38,6 +38,7 @@ __all__ = [
   "lin_vel_track_error",
   "yaw_track_error",
   "height_track_error",
+  "moving_command_fraction",
 ]
 
 
@@ -164,3 +165,18 @@ def height_track_error(
   foot_z = asset.data.site_pos_w[:, asset_cfg.site_ids, 2]
   base_height = root_z - torch.min(foot_z, dim=1).values
   return (base_height - command[:, 0] + ankle_sole_distance).abs()
+
+
+def moving_command_fraction(
+  env: ManagerBasedRlEnv, command_name: str, threshold: float = 0.1
+) -> torch.Tensor:
+  """1 while a locomotion command is active (``|v_xy| + |yaw| > threshold``).
+
+  Its episode average is the fraction of the episode spent under a moving
+  command. ``terrain_levels_task`` reads it: an episode spent mostly standing
+  says nothing about walking competence on that terrain.
+  """
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  total = torch.norm(command[:, :2], dim=1) + command[:, 2].abs()
+  return (total > threshold).float()

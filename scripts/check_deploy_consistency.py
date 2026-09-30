@@ -137,7 +137,11 @@ def main() -> int:
   ap.add_argument("--onnx", required=True)
   ap.add_argument("--deploy-yaml", required=True)
   ap.add_argument(
-    "--expect-obs-dim", type=int, default=71, help="Deployed actor observation width."
+    "--expect-obs-dim",
+    type=int,
+    default=71,
+    help="Deployed actor observation width PER FRAME. With history_length H in "
+    "the policy metadata the ONNX input is this times H.",
   )
   ap.add_argument(
     "--expect-action-dim", type=int, default=13, help="Deployed action width."
@@ -155,12 +159,17 @@ def main() -> int:
 
   r = Report()
 
+  # Frames of actor history per term (1 for every policy exported before
+  # history existed, whose metadata has no such key).
+  hist = int(meta.get("history_length", 1))
+  input_dim = args.expect_obs_dim * hist
+
   # -- 1. ONNX interface. Checked from the graph, not from metadata, so it
   #       holds even for a policy exported before this script existed.
   print("interface")
   r.check(
-    meta["_onnx_input_shape"] == [1, args.expect_obs_dim],
-    f"ONNX input is [1, {args.expect_obs_dim}]",
+    meta["_onnx_input_shape"] == [1, input_dim],
+    f"ONNX input is [1, {input_dim}]",
     str(meta["_onnx_input_shape"]),
   )
   r.check(
@@ -237,21 +246,43 @@ def main() -> int:
 
   # -- 5. Observation order. The concatenation order IS the network input.
   print("\nobservations")
-  deploy_obs = [OBS_NAME_MAP.get(k, k) for k in dep["observations"]]
+  # `use_gym_history` is a controller switch that lives in the same mapping as
+  # the terms (C++ ObservationManager). It must stay false: true interleaves
+  # the frames across terms, which is not the layout the policy was trained on.
+  dep_terms = {k: v for k, v in dep["observations"].items() if k != "use_gym_history"}
+  if "use_gym_history" in dep["observations"]:
+    r.check(
+      dep["observations"]["use_gym_history"] is False,
+      "use_gym_history is false",
+      str(dep["observations"]["use_gym_history"]),
+    )
+  deploy_obs = [OBS_NAME_MAP.get(k, k) for k in dep_terms]
   trained_obs = meta["observation_names"]
   r.check(
     deploy_obs == trained_obs,
     "observation term order",
     f"\n         deploy : {deploy_obs}\n         trained: {trained_obs}",
   )
-  deploy_widths = [len(v["scale"]) for v in dep["observations"].values()]
+  # Per-frame widths: deploy.yaml's scale lists are per frame, and the
+  # metadata's observation_dims are per frame too.
+  deploy_widths = [len(v["scale"]) for v in dep_terms.values()]
+  deploy_hist = [int(v.get("history_length", 1)) for v in dep_terms.values()]
+  if hist != 1 or any(h != 1 for h in deploy_hist):
+    r.check(
+      all(h == hist for h in deploy_hist),
+      f"every deploy.yaml term has history_length {hist}",
+      f"deploy {dict(zip(dep_terms, deploy_hist, strict=True))}",
+    )
   if "observation_dims" in meta:
     ok, detail = _close(meta["observation_dims"], deploy_widths, 0)
     r.check(ok, "observation term widths", detail)
+    total = sum(deploy_widths) * hist
     r.check(
-      meta["obs_dim"] == args.expect_obs_dim == sum(deploy_widths),
-      f"total observation width == {args.expect_obs_dim}",
-      f"trained {meta['obs_dim']}, deploy {sum(deploy_widths)}",
+      meta["obs_dim"] == input_dim == total == meta["_onnx_input_shape"][-1],
+      f"total observation width == {args.expect_obs_dim}"
+      + (f" x {hist} frames = {input_dim}" if hist != 1 else ""),
+      f"trained {meta['obs_dim']}, deploy {sum(deploy_widths)} x {hist} = {total}, "
+      f"ONNX input {meta['_onnx_input_shape'][-1]}",
     )
   else:
     r.skip("observation term widths", "observation_dims")

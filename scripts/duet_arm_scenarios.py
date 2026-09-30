@@ -35,7 +35,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
+import subprocess
 import sys
 from dataclasses import asdict
 
@@ -93,6 +96,9 @@ SCENARIOS = {
   "moving_turn": ([(2, 0, 0, 0), (5, 0, 0, 0.6), (5, 0, 0, -0.6), (3, 0, 0, 0)], [(1e9, 0.73)], "generator"),
   "moving_height": ([(20, 0, 0, 0)], [(5, 0.73), (7, 0.45), (8, 0.73)], "generator"),
 }
+
+
+_ROW_MARK = "@@SCENARIO_ROW@@ "
 
 
 def _schedule_value(schedule, t):
@@ -244,11 +250,35 @@ def main() -> int:
   ap.add_argument("--num-envs", type=int, default=128)
   ap.add_argument("--settle-s", type=float, default=3.0)
   ap.add_argument("--device", default=None)
+  ap.add_argument("--json-row", action="store_true", help=argparse.SUPPRESS)
   a = ap.parse_args()
   configure_torch_backends()
   device = a.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
   names = list(SCENARIOS) if a.scenario == "all" else [a.scenario]
-  rows = [run_scenario(n, a.checkpoint, a.task, device, a.num_envs, a.settle_s) for n in names]
+  if len(names) == 1:
+    rows = [run_scenario(names[0], a.checkpoint, a.task, device, a.num_envs, a.settle_s)]
+    if a.json_row:
+      print(_ROW_MARK + json.dumps(rows[0]))
+      return 0
+  else:
+    # One process per scenario. Measured on the rough-blind-tall tasks (which
+    # carry the terrain-scan raycast sensor): building the sixth env + runner in
+    # one process fails CUDA graph capture of the sensor graph ("Warp CUDA error
+    # 901"), while -Flat runs all eight in one process and any single scenario
+    # runs fine. Separate processes give every scenario a clean CUDA context.
+    rows = []
+    for n in names:
+      cmd = [sys.executable, os.path.abspath(__file__), "--checkpoint", a.checkpoint,
+             "--task", a.task, "--scenario", n, "--num-envs", str(a.num_envs),
+             "--settle-s", str(a.settle_s), "--json-row"]
+      if a.device:
+        cmd += ["--device", a.device]
+      out = subprocess.run(cmd, capture_output=True, text=True)
+      row = [ln for ln in out.stdout.splitlines() if ln.startswith(_ROW_MARK)]
+      if out.returncode != 0 or not row:
+        sys.stderr.write(out.stdout[-4000:] + out.stderr[-4000:])
+        raise RuntimeError(f"scenario {n} failed (rc={out.returncode})")
+      rows.append(json.loads(row[-1][len(_ROW_MARK):]))
   keys = [k for k in rows[0] if k != "scenario"]
   print(f"\n{'scenario':>16} " + " ".join(f"{k[:14]:>14}" for k in keys))
   for r in rows:

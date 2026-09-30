@@ -83,8 +83,9 @@ def main() -> int:
   env.close()
 
   print(f"\n[OK] exported {args.checkpoint} -> {onnx_path}")
-  print(f"     obs_dim={metadata['obs_dim']} action_dim={metadata['action_dim']} "
-        f"hash={metadata['deploy_config_hash']}")
+  print(f"     obs_dim={metadata['obs_dim']} "
+        f"(history_length={metadata['history_length']}) "
+        f"action_dim={metadata['action_dim']} hash={metadata['deploy_config_hash']}")
 
   # Write the contract alongside the ONNX in readable form, so a mismatch can
   # be diffed by eye without an ONNX reader.
@@ -104,7 +105,8 @@ def main() -> int:
       os.path.join(_REPO, "scripts", "check_deploy_consistency.py"),
       "--onnx", onnx_path,
       "--deploy-yaml", args.deploy_yaml,
-      "--expect-obs-dim", str(metadata["obs_dim"]),
+      # Per FRAME: the checker multiplies by the metadata's history_length.
+      "--expect-obs-dim", str(sum(metadata["observation_dims"])),
       "--expect-action-dim", str(metadata["action_dim"]),
     ]
   )

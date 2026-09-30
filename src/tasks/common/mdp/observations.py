@@ -70,3 +70,38 @@ def arm_traj_vel(
   """
   term = env.action_manager.get_term(action_term_name)
   return term.traj_vel
+
+
+def foot_friction_coef(
+  env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+  """Current sliding friction of the foot geoms, ``geom_friction[..., 0]``. [B, 1].
+
+  Privileged (critic only). The foot-friction event draws one value per env and
+  shares it across all 14 foot geoms, so the mean is that value. Read from the
+  live model, so it is whatever the latest randomisation wrote.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  gids = asset.indexing.geom_ids[asset_cfg.geom_ids]
+  mu = env.sim.model.geom_friction[:, gids, 0].mean(dim=1, keepdim=True)
+  return mu.expand(env.num_envs, 1)
+
+
+def foot_softness(
+  env: ManagerBasedRlEnv,
+  left_cfg: SceneEntityCfg,
+  right_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+  """Current contact time constant under each foot, ``geom_solref[..., 0]``. [B, 2].
+
+  Privileged (critic only), [left, right]. Each foot's seven collision geoms
+  share one sampled value (``mdp.geom_solref`` with ``shared_random``), and it
+  is re-drawn mid-episode, so this is read from the live model every step.
+  """
+  model = env.sim.model
+  out = []
+  for cfg in (left_cfg, right_cfg):
+    asset: Entity = env.scene[cfg.name]
+    gids = asset.indexing.geom_ids[cfg.geom_ids]
+    out.append(model.geom_solref[:, gids, 0].mean(dim=1))
+  return torch.stack(out, dim=1).expand(env.num_envs, 2)

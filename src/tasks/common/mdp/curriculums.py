@@ -235,3 +235,89 @@ def reward_weight(
     if env.common_step_counter > stage["step"]:
       reward_term_cfg.weight = stage["weight"]
   return torch.tensor([reward_term_cfg.weight])
+
+
+def terrain_levels_task(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  min_moving_fraction: float = 0.25,
+  max_lin_vel_error: float = 0.20,
+  max_yaw_error: float = 0.35,
+  max_height_error: float = 0.04,
+  max_idle_drift: float = 0.05,
+  demote_lin_vel_error: float = 0.35,
+  fell_term_name: str = "fell_over",
+) -> dict[str, torch.Tensor]:
+  """Terrain curriculum by task success, not by distance walked or survival.
+
+  Why not ``terrain_levels_vel``: it promotes only after 4 m of walking and
+  looks only at the LAST command, which in DUET (30% standing, commands
+  re-drawn every 3-8 s) almost never happens. Why not survival: that promotes
+  robots that stand still. Per finished episode:
+
+  - promote: timed out without falling, a moving command for at least
+    ``min_moving_fraction`` of the episode, and episode-mean velocity, yaw,
+    height tracking errors and idle drift all under their thresholds;
+  - demote: fell, or walked for at least ``min_moving_fraction`` of the
+    episode with mean velocity error at or above ``demote_lin_vel_error``;
+  - otherwise stay: an episode spent mostly standing is evidence neither way.
+
+  The curriculum manager runs FIRST in ``ManagerBasedRlEnv._reset_idx``, before
+  the metrics manager zeroes its sums, so the finished episode's per-step means
+  are ``_episode_sums / _step_count`` (private attributes, asserted below).
+  Envs promoted past the top row go to a random row, as in mjlab.
+  """
+  terrain = env.scene.terrain
+  assert terrain is not None and terrain.cfg.terrain_generator is not None
+  mm = env.metrics_manager
+  assert hasattr(mm, "_episode_sums") and hasattr(mm, "_step_count"), (
+    "terrain_levels_task reads MetricsManager._episode_sums/_step_count; "
+    "the mjlab metrics manager changed."
+  )
+  steps = mm._step_count[env_ids].clamp(min=1).float()
+
+  def mean(name: str) -> torch.Tensor:
+    return mm._episode_sums[name][env_ids] / steps
+
+  moving = mean("moving_command_fraction") >= min_moving_fraction
+  lin_err = mean("lin_vel_track_error")
+  fell = env.termination_manager.get_term(fell_term_name)[env_ids]
+  timed_out = env.termination_manager.time_outs[env_ids]
+  promote = (
+    timed_out
+    & ~fell
+    & moving
+    & (lin_err <= max_lin_vel_error)
+    & (mean("yaw_track_error") <= max_yaw_error)
+    & (mean("height_track_error") <= max_height_error)
+    & (mean("idle_root_drift") <= max_idle_drift)
+  )
+  demote = (fell | (moving & (lin_err >= demote_lin_vel_error))) & ~promote
+  terrain.update_env_origins(env_ids, promote, demote)
+  return {
+    "terrain_level_mean": torch.mean(terrain.terrain_levels.float()),
+    "promote_frac": promote.float().mean(),
+    "demote_frac": demote.float().mean(),
+  }
+
+
+def event_range_schedule(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  event_names: Sequence[str],
+  lower: float,
+  upper_stages: Sequence[Sequence[float]],
+) -> torch.Tensor:
+  """Ramp the upper bound of some events' ``ranges`` over training.
+
+  Modelled on ``push_magnitude``: ``upper_stages`` are (policy_step, upper)
+  knots, linearly interpolated, and every named event's ``ranges`` becomes
+  ``(lower, upper)``. Stateless and idempotent; the event cfgs themselves keep
+  their full range, so a play or evaluation config that clears the curriculum
+  samples the full distribution. Used to bring contact softness in gradually.
+  """
+  del env_ids  # Unused.
+  upper = piecewise_linear(env.common_step_counter, upper_stages)
+  for name in event_names:
+    env.event_manager.get_term_cfg(name).params["ranges"] = (lower, upper)
+  return torch.tensor([upper])

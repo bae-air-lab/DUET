@@ -1,0 +1,117 @@
+# rough_blind_tall_h1: v0/params/deploy.yaml with base_height range [0.24, 0.79] and
+# standstill 0.79 (Unitree-G1-23Dof-Duet-RoughBlind-Tall).
+# Lives under exported/, never deploy/: the controller loads the last-sorted
+# folder under config/policy/velocity/ that contains exported/.
+joint_ids_map: [0,1,2,3,4,5,6,7,8,9,10,11,12,15,16,17,18,19,22,23,24,25,26]
+step_dt: 0.02
+stiffness: [40.2, 99.1, 40.2, 99.1, 28.5, 28.5, 40.2, 99.1, 40.2, 99.1, 28.5, 28.5, 40.2,
+            14.3, 14.3, 14.3, 14.3, 14.3, 14.3, 14.3, 14.3, 14.3, 14.3]
+damping:   [2.6, 6.3, 2.6, 6.3, 1.8, 1.8, 2.6, 6.3, 2.6, 6.3, 1.8, 1.8, 2.6,
+            0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
+default_joint_pos: [-0.1,0,0,0.3,-0.2,0, -0.1,0,0,0.3,-0.2,0,  0,  0.35,0.18,0,0.87,0, 0.35,-0.18,0,0.87,0]
+
+commands:
+  base_velocity:
+    # These are the JOYSTICK CLAMPS (see observations.h velocity_commands: the
+    # stick value is clamped to these bounds before it reaches the policy), not
+    # what the policy was trained on. The policy trained to lin_vel_x (-0.8, 1.2),
+    # so every value here is well inside its distribution -- capping the remote
+    # narrows what an operator can ask for, it does not make the policy
+    # extrapolate.
+    ranges:
+      # Forward capped at 0.5 m/s for pick-and-place trials (2026-08-07):
+      # the robot does not need to move fast, and a lower cap makes the base
+      # steadier for manipulation.
+      lin_vel_x: [-0.5, 0.5]
+      lin_vel_y: [-0.5, 0.5]
+      ang_vel_z: [-1.0, 1.0]
+      heading: null
+  # Pelvis-height (squat) command. Read by the base_height_command observation.
+  # Must match BaseHeightCommandCfg.height_range in the trained task.
+  #
+  # !! CHANGED 2026-08-06: floor 0.12 -> 0.18. The old floor was KINEMATICALLY
+  # !! IMPOSSIBLE. Measured deepest reachable pelvis-above-flat-foot on this
+  # !! robot is 0.144 m, and only with hip_pitch pinned at its -2.53 rad limit.
+  # !! Commanding below that asked for something the robot cannot do, and the
+  # !! policy correctly learned to stop chasing it (it saturated ~0.22-0.25 m).
+  # !!
+  # !! CHANGED 2026-09-16: floor 0.18 -> 0.27. This is the operator clamp and it
+  # !! is what stops the D-pad asking for a depth the policy cannot hold. The
+  # !! arm-robustness policy trains down to 0.27 m only. Below that it does NOT
+  # !! fail loudly, it extrapolates: measured on model_11500, a 0.18 command
+  # !! produced ~0.20 m with the knee 0.05 rad and hip_pitch 0.09 rad PAST their
+  # !! soft limits. In sim that only costs reward; on hardware the SDK clamps the
+  # !! target, so the PD error never closes and the joint holds a stall current.
+  # !! That is a thermal and a margin problem, not a tracking one, and it is
+  # !! invisible in MuJoCo. 0.27 keeps every commandable depth inside the band
+  # !! the policy was trained and disturbance-tested at. 0.24 is the deepest
+# !! value that still leaves ~0.13 rad of joint-limit margin (0.204 m is the
+# !! zero-margin kinematic floor), so it must be paired with a policy whose
+# !! HEIGHT_RANGE floor is 0.24.
+  # !!
+  # !! Narrowing is safe for older policies too: the checker requires the
+  # !! deployed range to be a SUBSET of the trained range, and [0.27, 0.73] sits
+  # !! inside the 0.18 and 0.12 floors those were trained on.
+  # !! scripts/check_deploy_consistency.py enforces the pairing.
+  base_height:
+    # Resting and max height both 0.79 = height_max of the rough-blind-tall
+    # tasks (the measured natural standing height, rounded down). Floor 0.24.
+    range: [0.24, 0.79]
+    standstill: 0.79
+actions:
+  JointPositionAction:
+    clip: null
+    joint_names: [.*]
+    # Loco-manip carve-out: the RL policy controls ONLY the 13 lower-body joints
+    # (12 legs + waist_yaw). The 10 arm joints are driven externally on the
+    # rt/arm_targets topic, so they are NOT policy actions. joint_ids has length
+    # 13 -> action_dim = 13, matching the ONNX output. The first 13 entries of
+    # joint_ids_map (SDK 0..12) are these lower-body motors.
+    joint_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    scale:  [0.55, 0.35, 0.55, 0.35, 0.44, 0.44, 0.55, 0.35, 0.55, 0.35, 0.44, 0.44, 0.55]
+    offset: [-0.1, 0, 0, 0.3, -0.2, 0, -0.1, 0, 0, 0.3, -0.2, 0, 0]
+observations:
+  base_ang_vel:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  projected_gravity:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  velocity_commands:
+    params: {command_name: base_velocity}
+    clip: null
+    scale: [1.0, 1.0, 1.0]
+    history_length: 1
+  gait_phase:
+    params: {period: 0.6}
+    clip: null
+    scale: [1.0, 1.0]
+    history_length: 1
+  joint_pos_rel:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
+  joint_vel_rel:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
+  last_action:
+    params: {}
+    clip: null
+    scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    history_length: 1
+  # Loco-manip addition: 1-D pelvis-height (squat) command, appended LAST to match
+  # the training actor observation order (height_command is the final term).
+  base_height_command:
+    params: {}
+    clip: null
+    scale: [1.0]
+    history_length: 1

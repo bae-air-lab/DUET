@@ -38,17 +38,24 @@ Resuming therefore continues the curriculum where it stopped. There is no
 ``RESUME_AT_FULL_DISTRIBUTION`` switch and no source edit is required to resume.
 """
 
+import dataclasses
 import math
 
+import mjlab.terrains as terrain_gen
+from mjlab.actuator import DelayedActuatorCfg
+from mjlab.entity import EntityCfg
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+from mjlab.terrains.terrain_generator import TerrainGeneratorCfg
 
 from src.assets.robots import (
   G1_23DOF_ACTION_SCALE,
@@ -56,6 +63,12 @@ from src.assets.robots import (
   get_g1_23dof_deploy_robot_cfg,
   get_g1_23dof_robot_cfg,
 )
+from src.assets.robots.unitree_g1.g1_23dof_constants import (
+  G1_ACTUATOR_7520_14,
+  G1_ACTUATOR_7520_22,
+  G1_ACTUATOR_ANKLE,
+)
+from src.tasks.common.terrains import HfScaledRandomUniformTerrainCfg
 import src.tasks.duet.mdp as mdp
 from src.tasks.duet.duet_env_cfg import ITER, make_duet_env_cfg
 
@@ -242,6 +255,219 @@ HAND_PAYLOAD_KG = (0.25, 1.75)
 # 2*1.75 + 2.0 = 5.5 kg = 17% of the 32.1 kg robot.
 TORSO_PAYLOAD_KG = (-0.5, 2.0)
 
+##
+# Rough-blind-tall pass (2026-09), documents/duet/rough_blind_task.md. Every
+# value below is used only through a keyword argument of
+# ``unitree_g1_23dof_duet_rough_env_cfg`` whose default reproduces the tasks
+# that existed before this pass.
+##
+
+# Nominal height. Measured with scripts/duet_stand_height.py (Mode 1: default
+# pose, zero action, rigid plane, pelvis held level with its height free,
+# settled): h = 0.7949 m in the track_base_height convention, so height_max =
+# 0.79 (rounded down to 0.01). The old top of the command range, 0.73, sat 6 cm
+# below the pose the regulariser pulls toward.
+RB_TALL_HEIGHT_MAX = 0.79
+
+# Foot-site height above rigid flat ground at rest, measured by the same
+# script: the site sits 2.1 mm BELOW the sole (the capsule bottoms are at
+# z = -0.035 in the ankle-roll frame, the site at -0.037). Used by the
+# terrain-relative foot clearance (mdp.feet_clearance, reference="stance_foot").
+FOOT_SITE_Z_REST = -0.0021
+
+# Contact softness of the foot geoms (mdp.geom_solref, solref timeconst, s).
+# Measured with scripts/duet_contact_softness_sweep.py on the rigid plane: the
+# static sinkage at 0.30 s is 8.6 mm (0.20 s: 4.6 mm, 0.10 s: 1.4 mm), about 5x
+# less than the single-contact formula predicts, because the 28 foot contact
+# points share the load and each is regularised on its own. The operator's
+# litter sinkage is not measured yet, so the brief's 25 mm target applies,
+# which no timeconst under the 0.30 s hard cap reaches: tc_max is the cap. A
+# 5 cm drop at 0.30 s sinks 45 mm at most, inside the 50 mm tunnelling limit.
+FOOT_TC_MIN = 0.02
+FOOT_TC_MAX = 0.30
+# Ramp of the upper bound, (iteration, tc_max): rigid first, soft from 3000.
+FOOT_TC_MAX_STAGES = (
+  (0, FOOT_TC_MIN),
+  (1_000, FOOT_TC_MIN + 0.3 * (FOOT_TC_MAX - FOOT_TC_MIN)),
+  (3_000, FOOT_TC_MAX),
+)
+FOOT_TC_INTERVAL_S = (1.0, 3.0)  # mid-episode re-draw: patches of litter
+
+# Foot friction for the new tasks (HOMIE 0.1-2.0, DWL 0.2-2.0): 0.2 is a clean
+# slip without making walking impossible. The existing tasks keep (0.3, 1.6).
+RB_FOOT_FRICTION = (0.2, 1.6)
+
+# Sim-to-real randomisation. PD gains +-10% around nominal (HOMIE's range) on
+# the 13 lower-body joints; actuator latency 0-20 ms (4 physics steps of 5 ms)
+# on the leg and waist actuators, constant within an episode.
+RB_PD_GAIN_RANGE = (0.9, 1.1)
+RB_DELAY_MAX_LAG = 4
+# DelayBuffer re-samples a lag when (step_count + phase) % update_period == 0,
+# and reset() zeroes step_count. With no hold probability, no per-env phase and
+# a period longer than any episode (1e9 physics steps = 58 days of sim time),
+# the lag is drawn once at the first physics step after each reset and then
+# held: constant within an episode, re-sampled at reset, never jittering.
+RB_DELAY_UPDATE_PERIOD = 1_000_000_000
+
+# Task-success terrain curriculum thresholds (mdp.terrain_levels_task).
+RB_TERRAIN_PROMOTE = {
+  "min_moving_fraction": 0.25,
+  "max_lin_vel_error": 0.20,
+  "max_yaw_error": 0.35,
+  "max_height_error": 0.04,
+  "max_idle_drift": 0.05,
+}
+RB_TERRAIN_DEMOTE_LIN_VEL_ERROR = 0.35
+
+# Contact buffer for the litter terrain (per world, pooled across worlds). The
+# rough task's 48 cannot even build here: mujoco_warp's put_data checks it
+# against one CPU MjData at qpos0 -- straight legs at the world origin -- which
+# overlaps whatever tile is there (measured 117 contacts on the training grid,
+# up to 143 on the random play/eval grids; capsule-vs-heightfield collisions
+# make many contacts). At runtime standing on the heightfields uses 24/world on
+# average with step peaks of 43-47, i.e. 90-98% of 48. 256 costs no measurable
+# throughput (19.9k vs 19.8k env-steps/s at 4096 envs for 128 vs 256).
+LITTER_NCONMAX = 256
+
+# Spawn height offset on the litter terrain (added to reset_base's z). Measured
+# on the hardest row with rigid feet: waves tiles put a wave crest up to 4 cm
+# above the tile origin inside the +-0.5 m spawn window while the sole starts
+# 1.6 cm above the origin, so feet spawned up to 14 mm inside the surface and
+# the robot popped off the ground at 0.35 m/s. Every other sub-terrain spawned
+# clean. 2.5 cm clears the worst case (2.4 cm).
+LITTER_SPAWN_Z = 0.025
+
+FOOT_GEOM_NAMES = tuple(
+  f"{side}_foot{i}_collision" for side in ("left", "right") for i in range(1, 8)
+)
+
+# The deployed actor interface: the -Flat task's actor terms, in order (see
+# the observation contract at the top of src/tasks/duet/duet_env_cfg.py).
+DEPLOY_ACTOR_TERMS = (
+  "base_ang_vel",
+  "projected_gravity",
+  "command",
+  "phase",
+  "joint_pos",
+  "joint_vel",
+  "actions",
+  "height_command",
+)
+
+
+def _delayed_lower_body_robot_cfg() -> EntityCfg:
+  """A fresh G1-23DOF cfg whose leg and waist actuators carry 0-20 ms latency.
+
+  Built here rather than in g1_23dof_constants.py, whose action-scale loop
+  asserts BuiltinPositionActuatorCfg. The wrapped groups are the same objects
+  with the same nominal gains, so G1_23DOF_ACTION_SCALE and the exported gains
+  are unchanged; the arm group (5020) is not delayed.
+  """
+  robot = get_g1_23dof_robot_cfg()
+  assert robot.articulation is not None
+  wrap = (G1_ACTUATOR_7520_14, G1_ACTUATOR_7520_22, G1_ACTUATOR_ANKLE)
+  actuators = tuple(
+    DelayedActuatorCfg(
+      base_cfg=act,
+      delay_target="position",
+      delay_min_lag=0,
+      delay_max_lag=RB_DELAY_MAX_LAG,
+      delay_hold_prob=0.0,
+      delay_update_period=RB_DELAY_UPDATE_PERIOD,
+      delay_per_env_phase=False,
+    )
+    if any(act is w for w in wrap)
+    else act
+    for act in robot.articulation.actuators
+  )
+  assert sum(isinstance(a, DelayedActuatorCfg) for a in actuators) == len(wrap)
+  robot.articulation = dataclasses.replace(robot.articulation, actuators=actuators)
+  return robot
+
+
+def litter_terrain_generator_cfg() -> TerrainGeneratorCfg:
+  """Poultry-litter-like terrain: small bumps, gentle undulation, caked clumps.
+
+  Litter is loose shavings, hulls or straw, several centimetres (up to ~15 cm)
+  deep. Every sub-terrain is scaled by difficulty (row), and every surface
+  statistic was measured with ``scripts/duet_terrain_stats.py`` (gate G6).
+  Columns are allocated by proportion over 20 columns (3 flat, 6 bumps,
+  4 undulation, 2 waves, 2 slope, 1 inverted slope, 2 clumps).
+  """
+  return TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    curriculum=True,
+    sub_terrains={
+      "flat": terrain_gen.BoxFlatTerrainCfg(proportion=0.15),
+      # Fine bumps: 0 at difficulty 0, up to 4 cm in 5 mm steps at 1.
+      "fine_bumps": HfScaledRandomUniformTerrainCfg(
+        proportion=0.30,
+        noise_range=(0.0, 0.04),
+        noise_step=0.005,
+        border_width=0.25,
+      ),
+      # Gentle undulation: peak-to-peak up to 6 cm, wavelength ~1.9 m with
+      # octaves down to ~0.5 m. The 5 mm floor is not cosmetic: at exactly 0
+      # the heightfield has zero height and MuJoCo refuses to compile it.
+      # 10 cm cells, not mjlab's 5 cm default: at 5 cm a fallen body overlaps
+      # 50+ cells and mujoco_warp drops contacts ("height field collision
+      # overflow"); measured, this sub-terrain produced all of them.
+      "undulation": terrain_gen.HfPerlinNoiseTerrainCfg(
+        proportion=0.20,
+        height_range=(0.005, 0.06),
+        octaves=3,
+        persistence=0.5,
+        lacunarity=2.0,
+        scale=5.0,
+        horizontal_scale=0.1,
+        resolution=0.1,
+        border_width=0.25,
+      ),
+      # Waves: amplitude up to 4 cm about the mean (8 cm peak-to-peak).
+      "waves": terrain_gen.HfWaveTerrainCfg(
+        proportion=0.10,
+        amplitude_range=(0.0, 0.04),
+        num_waves=4,
+        border_width=0.25,
+      ),
+      # Gentle floor slope up to 0.15 (~8.5 deg), both directions.
+      "slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+        proportion=0.075,
+        slope_range=(0.0, 0.15),
+        platform_width=2.0,
+        border_width=0.25,
+      ),
+      "slope_inv": terrain_gen.HfPyramidSlopedTerrainCfg(
+        proportion=0.075,
+        slope_range=(0.0, 0.15),
+        platform_width=2.0,
+        border_width=0.25,
+        inverted=True,
+      ),
+      # Caked clumps: 0.3 m cells, heights in +-2.5 cm at difficulty 1.
+      # Equal-height neighbours are MERGED (heights snap to 1.25 cm levels:
+      # 0, +-1.25, +-2.5 cm). Measured: as individual boxes the two clump
+      # columns are ~12,500 geoms, which pushes mujoco_warp past its 250k
+      # candidate-pair limit onto the segmented sweep-and-prune broadphase;
+      # there, at 1024 envs, collision detection silently returns NO contacts
+      # (robots fall through the floor, no warning), and at 4096 envs CUDA
+      # graph creation runs out of memory. Merged, the scene is ~6,200 geoms
+      # and keeps the n-squared broadphase (4096 envs, 19.9k env-steps/s).
+      "clumps": terrain_gen.BoxRandomGridTerrainCfg(
+        proportion=0.10,
+        grid_width=0.3,
+        grid_height_range=(0.0, 0.025),
+        platform_width=1.0,
+        merge_similar_heights=True,
+        height_merge_threshold=0.0125,
+      ),
+    },
+    add_lights=True,
+  )
+
 
 def _arm_pose(
   pitch: float, roll: float, yaw: float, elbow: float, wrist: float = 0.0
@@ -389,6 +615,16 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   command_curriculum: bool = True,
   joint_vel_noise: float | None = None,
   idle_precision: bool = True,
+  height_max: float = HEIGHT_RANGE[1],
+  actor_height_scan: bool = True,
+  actor_history: int = 1,
+  litter_terrain: bool = False,
+  clearance_reference: str = "world",
+  contact_softness: bool = False,
+  friction_range: tuple[float, float] | None = None,
+  sim2real_dr: bool = False,
+  terrain_curriculum: str = "vel",
+  privileged_contact_obs: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create the G1-23DOF DUET rough-terrain configuration.
 
@@ -412,7 +648,26 @@ def unitree_g1_23dof_duet_rough_env_cfg(
     command_curriculum: When False, sample the final (hardest) command
       distribution from step 0 instead of staging into it.
     joint_vel_noise: Override the joint-velocity observation noise half-width.
+
+  Rough-blind-tall pass (documents/duet/rough_blind_task.md). Every default
+  below reproduces the configs that existed before the pass:
+    height_max: top of the height command range = the nominal height.
+    actor_height_scan: False removes ``height_scan`` from the ACTOR only (the
+      critic keeps it, privileged); the actor then has exactly the -Flat terms.
+    actor_history: frames of actor observation history (critic stays at 1).
+    litter_terrain: the litter terrain generator instead of mjlab's rough mix.
+    clearance_reference: ``feet_clearance`` height reference, world|stance_foot.
+    contact_softness: per-foot ``geom_solref`` timeconst randomisation, re-drawn
+      at reset and mid-episode, with its upper bound ramped in over training.
+    friction_range: foot friction range (None keeps (0.3, 1.6)).
+    sim2real_dr: PD gains +-10% and 0-20 ms actuator latency on the lower body.
+    terrain_curriculum: ``vel`` (mjlab distance rule) or ``task`` (task success).
+    privileged_contact_obs: critic-only foot friction and foot softness terms.
   """
+  if terrain_curriculum not in ("vel", "task"):
+    raise ValueError(f"terrain_curriculum must be vel|task, got {terrain_curriculum!r}")
+  if sim2real_dr and deploy_gains:
+    raise ValueError("sim2real_dr is defined for the first-principles gains only")
   cfg = make_duet_env_cfg()
 
   cfg.sim.mujoco.ccd_iterations = 500
@@ -422,6 +677,8 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   cfg.scene.entities = {
     "robot": get_g1_23dof_deploy_robot_cfg()
     if deploy_gains
+    else _delayed_lower_body_robot_cfg()
+    if sim2real_dr
     else get_g1_23dof_robot_cfg()
   }
 
@@ -458,6 +715,12 @@ def unitree_g1_23dof_duet_rough_env_cfg(
     history_length=4,
   )
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground_cfg, self_collision_cfg)
+
+  if litter_terrain:
+    assert cfg.scene.terrain is not None
+    cfg.scene.terrain.terrain_generator = litter_terrain_generator_cfg()
+    cfg.sim.nconmax = LITTER_NCONMAX
+    cfg.events["reset_base"].params["pose_range"]["z"] = (LITTER_SPAWN_Z, LITTER_SPAWN_Z)
 
   if cfg.scene.terrain is not None and cfg.scene.terrain.terrain_generator is not None:
     cfg.scene.terrain.terrain_generator.curriculum = True
@@ -526,7 +789,11 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   base_height_cmd = cfg.commands["base_height"]
   assert isinstance(base_height_cmd, mdp.BaseHeightCommandCfg)
   base_height_cmd.enabled = height_mode == "command"
-  base_height_cmd.height_range = HEIGHT_RANGE
+  # height_range[1] is the nominal height (BaseHeightCommand pins the
+  # nominal-height slice and the GUI slider's top to it). The squat floor, walk
+  # band and command-mix schedules do not depend on it, so with a raised
+  # height_max walking spans [walk_min_height, height_max].
+  base_height_cmd.height_range = (HEIGHT_RANGE[0], height_max)
 
   cfg.observations["critic"].terms["foot_height"].params[
     "asset_cfg"
@@ -698,6 +965,111 @@ def unitree_g1_23dof_duet_rough_env_cfg(
     # Ablation: no staging. Sample the final distribution from step 0.
     pin_duet_full_distribution(cfg)
 
+  ##
+  # Rough-blind-tall pass. Each block is inert at its keyword's default.
+  ##
+
+  # Blind actor: the actor loses height_scan, the critic keeps it. The actor
+  # must then be the deployed -Flat interface, term for term, in order.
+  if not actor_height_scan:
+    del cfg.observations["actor"].terms["height_scan"]
+    actor_terms = tuple(cfg.observations["actor"].terms)
+    assert actor_terms == DEPLOY_ACTOR_TERMS, actor_terms
+  # Actor history: each term's frames oldest -> newest, concatenated per term
+  # (mjlab CircularBuffer; the C++ ObservationManager with use_gym_history
+  # false builds the same layout). The critic stays at one frame.
+  cfg.observations["actor"].history_length = actor_history
+
+  if privileged_contact_obs:
+    critic = cfg.observations["critic"].terms
+    critic["foot_friction_coef"] = ObservationTermCfg(
+      func=mdp.foot_friction_coef,
+      params={"asset_cfg": SceneEntityCfg("robot", geom_names=FOOT_GEOM_NAMES)},
+    )
+    critic["foot_softness"] = ObservationTermCfg(
+      func=mdp.foot_softness,
+      params={
+        "left_cfg": SceneEntityCfg("robot", geom_names=FOOT_GEOM_NAMES[:7]),
+        "right_cfg": SceneEntityCfg("robot", geom_names=FOOT_GEOM_NAMES[7:]),
+      },
+    )
+
+  if friction_range is not None:
+    cfg.events["foot_friction"].params["ranges"] = friction_range
+
+  if contact_softness:
+    # Per foot, one timeconst shared by its seven capsules (the foot geoms have
+    # priority 1, so theirs is the solref MuJoCo uses). Drawn at reset and
+    # re-drawn every 1-3 s: the ground under each foot changes within an
+    # episode, as it does across patches of litter. The cfg holds the full
+    # range; the curriculum below ramps the upper bound in.
+    names = []
+    for side, geoms in (("left", FOOT_GEOM_NAMES[:7]), ("right", FOOT_GEOM_NAMES[7:])):
+      for mode in ("reset", "interval"):
+        name = f"foot_softness_{side}" + ("_interval" if mode == "interval" else "")
+        cfg.events[name] = EventTermCfg(
+          mode=mode,
+          interval_range_s=FOOT_TC_INTERVAL_S if mode == "interval" else None,
+          func=mdp.geom_solref,
+          params={
+            "asset_cfg": SceneEntityCfg("robot", geom_names=geoms),
+            "operation": "abs",
+            "ranges": (FOOT_TC_MIN, FOOT_TC_MAX),
+            "shared_random": True,
+          },
+        )
+        names.append(name)
+    cfg.curriculum["foot_softness"] = CurriculumTermCfg(
+      func=mdp.event_range_schedule,
+      params={
+        "event_names": names,
+        "lower": FOOT_TC_MIN,
+        "upper_stages": [(i * ITER, v) for i, v in FOOT_TC_MAX_STAGES],
+      },
+    )
+
+  if sim2real_dr:
+    # PD gains +-10% around nominal, lower body only. dr.pd_gains indexes
+    # entity.actuators -- the actuator GROUPS in articulation order -- with
+    # asset_cfg.actuator_ids, while actuator_names would resolve to per-joint
+    # ctrl indices (0..22); so the ids here are group indices, computed from the
+    # robot cfg. Verified on a 4-env build: exactly the 13 lower-body
+    # actuators' gainprm/biasprm change. Export metadata reads the nominal gains
+    # from mj_model, which this does not touch.
+    robot_cfg = cfg.scene.entities["robot"]
+    assert robot_cfg.articulation is not None
+    lower_groups = [
+      i
+      for i, act in enumerate(robot_cfg.articulation.actuators)
+      if not any(tok in expr for expr in act.target_names_expr for tok in _ARM_TOKENS)
+    ]
+    cfg.events["pd_gains"] = EventTermCfg(
+      mode="startup",
+      func=dr.pd_gains,
+      params={
+        "asset_cfg": SceneEntityCfg("robot", actuator_ids=lower_groups),
+        "kp_range": RB_PD_GAIN_RANGE,
+        "kd_range": RB_PD_GAIN_RANGE,
+        "operation": "scale",
+      },
+    )
+
+  if clearance_reference != "world":
+    cfg.rewards["foot_clearance"].params["reference"] = clearance_reference
+    cfg.rewards["foot_clearance"].params["z_rest"] = FOOT_SITE_Z_REST
+
+  if terrain_curriculum == "task":
+    cfg.metrics["moving_command_fraction"] = MetricsTermCfg(
+      func=mdp.moving_command_fraction, params={"command_name": "twist"}
+    )
+    cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
+      func=mdp.terrain_levels_task,
+      params={
+        **RB_TERRAIN_PROMOTE,
+        "demote_lin_vel_error": RB_TERRAIN_DEMOTE_LIN_VEL_ERROR,
+      },
+    )
+
   if play:
     cfg.episode_length_s = int(1e9)
     cfg.observations["actor"].enable_corruption = False
@@ -764,4 +1136,67 @@ def unitree_g1_23dof_duet_flat_env_cfg(
     twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
     twist_cmd.ranges.ang_vel_z = (-0.5, 0.5)
 
+  return cfg
+
+
+# Everything that defines the rough-blind-tall tasks except the actor history.
+RB_TALL_KWARGS = dict(
+  height_max=RB_TALL_HEIGHT_MAX,
+  actor_height_scan=False,
+  litter_terrain=True,
+  clearance_reference="stance_foot",
+  contact_softness=True,
+  friction_range=RB_FOOT_FRICTION,
+  sim2real_dr=True,
+  terrain_curriculum="task",
+  privileged_contact_obs=True,
+)
+
+
+def unitree_g1_23dof_duet_rough_blind_tall_env_cfg(
+  play: bool = False, actor_history: int = 1, evaluation: str | None = None
+) -> ManagerBasedRlEnvCfg:
+  """Blind DUET policy for loose litter at the natural standing height.
+
+  Litter-like terrain, per-foot contact softness and a low-friction tail,
+  PD-gain and latency randomisation, a task-success terrain curriculum,
+  terrain-relative swing height, nominal height 0.79 m; the actor sees exactly
+  the -Flat 71-D interface per frame (``actor_history`` frames of it) and the
+  critic additionally sees the height scan, foot friction and foot softness.
+
+  Args:
+    play: Play settings (as the rough play cfg, with ``randomize_terrain``).
+    actor_history: Actor frames: 5 for the -H5 task, 1 for the drop-in task.
+    evaluation: ``None`` for training/play, or a fixed evaluation condition.
+      Both keep the terrain_scan sensor and the critic layout, so any
+      checkpoint of the task loads, and both use the play settings.
+      ``flat``   -- plane terrain, contact timeconst fixed at 0.02 (rigid):
+                    comparable to v8's scenario results.
+      ``litter`` -- litter generator, no curriculum, difficulty 0.8-1.0,
+                    timeconst fixed at tc_max, foot friction fixed at 0.3.
+  """
+  if evaluation not in (None, "flat", "litter"):
+    raise ValueError(f"evaluation must be None|flat|litter, got {evaluation!r}")
+  cfg = unitree_g1_23dof_duet_rough_env_cfg(
+    play=play or evaluation is not None, actor_history=actor_history, **RB_TALL_KWARGS
+  )
+  if evaluation is None:
+    return cfg
+
+  softness = [n for n in cfg.events if n.startswith("foot_softness_")]
+  assert len(softness) == 4, softness
+  assert cfg.scene.terrain is not None
+  if evaluation == "flat":
+    tc = FOOT_TC_MIN
+    cfg.scene.terrain.terrain_type = "plane"
+    cfg.scene.terrain.terrain_generator = None
+    cfg.events.pop("randomize_terrain", None)
+  else:
+    tc = FOOT_TC_MAX
+    gen = cfg.scene.terrain.terrain_generator
+    assert gen is not None and not gen.curriculum
+    gen.difficulty_range = (0.8, 1.0)
+    cfg.events["foot_friction"].params["ranges"] = (0.3, 0.3)
+  for name in softness:
+    cfg.events[name].params["ranges"] = (tc, tc)
   return cfg

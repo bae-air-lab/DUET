@@ -219,10 +219,30 @@ def feet_clearance(
   command_name: str | None = None,
   command_threshold: float = 0.1,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  reference: str = "world",
+  z_rest: float = 0.0,
 ) -> torch.Tensor:
-  """Penalize deviation from target clearance height, weighted by foot velocity."""
+  """Penalize deviation from target clearance height, weighted by foot velocity.
+
+  ``reference`` sets what the foot height is measured from:
+
+  - ``"world"`` (default): the foot site's world z against ``target_height``.
+    Only right on a flat tile whose surface is at z = 0; on any raised or
+    lowered terrain tile the swing-height target is wrong.
+  - ``"stance_foot"``: the foot's height above the LOWER foot,
+    ``foot_z - min(foot_z)``, against ``target_height - z_rest``, where
+    ``z_rest`` is the foot site's height above rigid flat ground at rest
+    (measured by ``scripts/duet_stand_height.py``). On flat rigid ground both
+    references give the same cost for the same motion; on terrain or soft
+    ground the target follows the stance foot.
+  """
   asset: Entity = env.scene[asset_cfg.name]
   foot_z = asset.data.site_pos_w[:, asset_cfg.site_ids, 2]  # [B, N]
+  if reference == "stance_foot":
+    foot_z = foot_z - torch.min(foot_z, dim=1, keepdim=True).values
+    target_height = target_height - z_rest
+  elif reference != "world":
+    raise ValueError(f"reference must be world|stance_foot, got {reference!r}")
   foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]  # [B, N, 2]
   vel_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, N]
   delta = torch.abs(foot_z - target_height)  # [B, N]
