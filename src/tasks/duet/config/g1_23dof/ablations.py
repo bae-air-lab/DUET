@@ -21,7 +21,7 @@ Abl-UniformArm      HOMIE (a): arm goals 100% uniform over the safe workspace.
                     the reference does not
 Abl-NoArmCurriculum HOMIE (a), removed: arms pinned at the default pose, so the
                     lower body never sees an upper-body disturbance
-Abl-NoHeightCmd     HOMIE (b), removed: height pinned at 0.73; the observation
+Abl-NoHeightCmd     HOMIE (b), removed: height pinned at 0.78; the observation
                     slot remains (constant) so the 71-D interface is preserved
 Abl-NoSymmetry      HOMIE (c), removed: no augmentation, no mirror loss.
                     Loss/symmetry is still logged, so this variant reports the

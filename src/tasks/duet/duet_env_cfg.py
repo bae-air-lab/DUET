@@ -18,9 +18,10 @@ changing ``deploy/robots/g1_23dof/config/policy/velocity/v0/params/deploy.yaml``
               + 23 joint_pos + 23 joint_vel + 13 last_action + 1 height_command
               = 71                                       -> 13 actions
 
-``height_command`` is emitted LAST. On rough terrain ``height_scan`` is inserted
-before it; the flat task (the one that gets deployed) deletes ``height_scan``,
-restoring exactly 71.
+``height_command`` is emitted LAST. The actor is blind on every terrain: the
+robot has no height map, so ``height_scan`` is a critic-only (privileged) term
+and the rough and flat actors are the same 71-D layout. The flat task also
+drops it from the critic, since there is no terrain to scan.
 """
 
 import math
@@ -53,6 +54,7 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
 import src.tasks.duet.mdp as mdp
+from src.tasks.common.terrains import SoftFlatTerrainCfg
 
 # One training iteration = num_steps_per_env policy steps. Curriculum "step"
 # fields count POLICY steps, so schedules are written as `iterations * _ITER`.
@@ -66,6 +68,25 @@ ITER = 24
 # benchmark against, uses 2.0 -- larger than this. Kept, and measured against
 # the physical value by the `Abl-LowVelNoise` variant rather than assumed.
 JOINT_VEL_NOISE = 1.5
+
+# Rough terrain: mjlab's ROUGH_TERRAINS_CFG with both stair types (0.2 + 0.2)
+# replaced by one soft-floor type at their combined 0.4, so it takes the same
+# 8 of the 20 columns the stairs did. Everything else is unchanged. Stairs are
+# not part of the deployment site (a poultry house), whereas soft, slippery
+# litter is. See ``src/tasks/common/terrains.py`` for the contact model.
+_ROUGH = ROUGH_TERRAINS_CFG.sub_terrains
+DUET_TERRAINS_CFG = replace(
+  ROUGH_TERRAINS_CFG,
+  sub_terrains={
+    "flat": _ROUGH["flat"],
+    "soft_floor": SoftFlatTerrainCfg(proportion=0.4),
+    **{
+      name: sub
+      for name, sub in _ROUGH.items()
+      if name not in ("flat", "pyramid_stairs", "pyramid_stairs_inv")
+    },
+  },
+)
 
 
 def make_duet_env_cfg() -> ManagerBasedRlEnvCfg:
@@ -118,12 +139,6 @@ def make_duet_env_cfg() -> ManagerBasedRlEnvCfg:
       noise=Unoise(n_min=-JOINT_VEL_NOISE, n_max=JOINT_VEL_NOISE),
     ),
     "actions": ObservationTermCfg(func=mdp.last_action),
-    "height_scan": ObservationTermCfg(
-      func=envs_mdp.height_scan,
-      params={"sensor_name": "terrain_scan"},
-      noise=Unoise(n_min=-0.1, n_max=0.1),
-      scale=1 / terrain_scan.max_distance,
-    ),
     # HOMIE contribution (b): pelvis height is a first-class command, not a
     # constant. Emitted last so the flat task's obs vector is exactly 71-D.
     "height_command": ObservationTermCfg(
@@ -139,6 +154,9 @@ def make_duet_env_cfg() -> ManagerBasedRlEnvCfg:
       params={"sensor_name": "robot/imu_lin_vel"},
       noise=Unoise(n_min=-0.5, n_max=0.5),
     ),
+    # Privileged: the critic sees the terrain under the robot, which lowers
+    # value-target variance on rough tiles. NOT in the actor -- the robot has
+    # no height map, and the actor must stay the 71-D deployed interface.
     "height_scan": ObservationTermCfg(
       func=envs_mdp.height_scan,
       params={"sensor_name": "terrain_scan"},
@@ -672,7 +690,7 @@ def make_duet_env_cfg() -> ManagerBasedRlEnvCfg:
     scene=SceneCfg(
       terrain=TerrainEntityCfg(
         terrain_type="generator",
-        terrain_generator=replace(ROUGH_TERRAINS_CFG),
+        terrain_generator=replace(DUET_TERRAINS_CFG),
         max_init_terrain_level=5,
       ),
       sensors=(terrain_scan,),

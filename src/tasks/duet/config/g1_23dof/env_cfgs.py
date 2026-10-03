@@ -134,7 +134,16 @@ _ARM_TOKENS = ("shoulder", "elbow", "wrist")
 # "base_height range within trained range" test until that file is narrowed to
 # [0.27, 0.73] alongside a policy exported from this run. That failure is the
 # mechanism working, not a regression.
-HEIGHT_RANGE = (0.24, 0.73)
+#
+# Ceiling raised 0.73 -> 0.78 on 2026-10-03. model_21000 (flat, ceiling 0.73)
+# stood visibly too low on the real robot. Training the top of the band at 0.78
+# -- just under the 0.786 m default joint pose -- lets the deployed standing
+# height be chosen anywhere in [0.24, 0.78] (e.g. 0.75) without extrapolating.
+# The nominal standing height is height_range[1], so the nominal-height slice,
+# idle standing and Abl-NoHeightCmd all move to 0.78 with it. deploy.yaml and
+# keyboard.py still carry 0.73 for model_21000; widen them only alongside a
+# policy exported from a run trained with this ceiling.
+HEIGHT_RANGE = (0.24, 0.78)
 WALK_MIN_HEIGHT_FINAL = 0.60  # walking is restricted to >= 0.60 m
 
 # Squat-floor schedule, (iteration, floor m): near-nominal through the
@@ -405,8 +414,8 @@ def unitree_g1_23dof_duet_rough_env_cfg(
                       plus independent per-joint noise.
       ``off``      -- arms pinned at the default pose; no upper-body disturbance.
     height_mode: HOMIE contribution (b) ablation.
-      ``command`` -- pelvis height sampled in [0.12, 0.73] (default).
-      ``fixed``   -- height pinned at 0.73; the obs slot stays (constant), so
+      ``command`` -- pelvis height sampled in HEIGHT_RANGE (default).
+      ``fixed``   -- height pinned at HEIGHT_RANGE[1]; the obs slot stays (constant), so
                      the 71-D interface and deployability are unchanged.
     payload: When False, drop hand and torso payload randomisation entirely.
     command_curriculum: When False, sample the final (hardest) command
@@ -733,10 +742,11 @@ def unitree_g1_23dof_duet_rough_env_cfg(
 def unitree_g1_23dof_duet_flat_env_cfg(
   play: bool = False, **kwargs
 ) -> ManagerBasedRlEnvCfg:
-  """Flat-terrain DUET config. This is the variant that gets deployed.
+  """Flat-terrain DUET config.
 
-  Deleting ``height_scan`` from both observation groups is what makes the actor
-  observation exactly 71-D, matching the deployed ONNX input.
+  The actor is already the 71-D deployed layout (``height_scan`` is critic-only
+  in the base config); with no terrain to scan, the critic term and the
+  raycast sensor are dropped too.
   """
   cfg = unitree_g1_23dof_duet_rough_env_cfg(play=play, **kwargs)
 
@@ -752,7 +762,6 @@ def unitree_g1_23dof_duet_flat_env_cfg(
   cfg.scene.sensors = tuple(
     s for s in (cfg.scene.sensors or ()) if s.name != "terrain_scan"
   )
-  del cfg.observations["actor"].terms["height_scan"]
   del cfg.observations["critic"].terms["height_scan"]
 
   cfg.curriculum.pop("terrain_levels", None)

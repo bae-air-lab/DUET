@@ -8,8 +8,8 @@ from .env_cfgs import (
 )
 from .rl_cfg import unitree_g1_23dof_duet_ppo_runner_cfg
 
-# Flat is the variant that gets deployed: its actor observation is exactly 71-D
-# (no height_scan), matching the ONNX the C++ controller loads.
+# Both Flat and Rough have the same blind 71-D actor observation, matching the
+# ONNX the C++ controller loads; Rough keeps height_scan in the critic only.
 register_mjlab_task(
   task_id="Unitree-G1-23Dof-Duet-Flat",
   env_cfg=unitree_g1_23dof_duet_flat_env_cfg(),
