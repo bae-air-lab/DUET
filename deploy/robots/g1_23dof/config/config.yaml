@@ -14,8 +14,8 @@ FSM:
 
   Passive:
     transitions: 
-      FixStand: LT + up.on_pressed
-      # FixStand: F1.on_pressed 
+      FixStand: "(LT + up.on_pressed) | F1.on_pressed"
+      # F1 = keyboard.py key "1"; LT+up = gamepad L2+Up
     mode: [
       1,1,1,1,1,1,
       1,1,1,1,1,1,
@@ -32,10 +32,10 @@ FSM:
     ]
   FixStand:
     transitions: 
-      Passive: LT + B.on_pressed
-      # Passive: start.on_pressed
-      # Velocity: F2.on_pressed 
-      Velocity: RT + A.on_pressed
+      Passive: "(LT + B.on_pressed) | start.on_pressed"
+      # start = keyboard.py Enter; LT+B = gamepad L2+B
+      # F2 = keyboard.py key "2"; RT+A = gamepad R2+A
+      Velocity: "(RT + A.on_pressed) | F2.on_pressed"
     kp: [
       100., 100., 100., 150., 40., 40.,
       100., 100., 100., 150., 40., 40.,
@@ -62,8 +62,22 @@ FSM:
     ]
   Velocity:
     transitions: 
-      Passive: LT + B.on_pressed
-      # Passive: start.on_pressed 
+      Passive: "(LT + B.on_pressed) | start.on_pressed"
+      # start = keyboard.py Enter; LT+B = gamepad L2+B
+      # HARNESS HOLD (added 2026-09-16). Leaving the policy running while the
+      # robot is lifted is the one routine lab operation it handles badly: with
+      # the feet off the floor there is no ground reaction, so the legs track
+      # unreachable height and velocity targets against no load and thrash.
+      # Suspension cannot be detected reliably on this robot -- it has no foot
+      # force sensors, and leg torque does NOT separate the two cases (measured:
+      # 9.5 Nm total standing at 0.73 m, versus 24.4 Nm hanging with the legs
+      # folded), so any automatic cut-out would risk freezing the legs mid-stride.
+      # Instead this is an explicit operator action, on the same key that means
+      # "go to FixStand" everywhere else. FixStand interpolates from wherever the
+      # legs are over 3 s (see ts/qs above), so it eases in rather than snapping,
+      # and then holds a fixed stance under PD -- the right state to be lifted in.
+      # Press 1 BEFORE lifting; press 2 to hand back to the policy afterwards.
+      FixStand: "(LT + up.on_pressed) | F1.on_pressed"
     policy_dir: config/policy/velocity
 
 

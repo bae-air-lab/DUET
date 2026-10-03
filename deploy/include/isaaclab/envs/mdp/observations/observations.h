@@ -4,6 +4,9 @@
 #pragma once
 
 #include <cstdio>
+#include <cmath>
+#include <algorithm>
+#include <Eigen/Geometry>
 
 #include "isaaclab/envs/manager_based_rl_env.h"
 
@@ -176,13 +179,79 @@ REGISTER_OBSERVATION(base_height_command)
     if (std::fabs(err) <= max_step) h = cmd_target;
     else h += std::copysign(max_step, err);
 
-    // Debug: print the current commanded base height, throttled to ~2 Hz
-    // (control loop is ~50 Hz, so every 25 steps).
-    static int _bh_print = 0;
-    if (++_bh_print % 25 == 0) {
-        printf("[base_height] current cmd = %.3f m  (target %.3f, walking=%s)\n",
-               h, target, (cmd_target > target + 1e-4f) ? "yes" : "no");
-        fflush(stdout);
+    // ACHIEVED pelvis height above the lower foot, printed next to the command
+    // so the two can be compared. They diverge near the bottom of the range,
+    // where the policy saturates and returns much the same pose for ever-lower
+    // commands -- invisible from the console without this.
+    //
+    // Exact 3-D forward kinematics of each leg, not a sagittal-plane estimate.
+    // A planar version was tried first and is WRONG by up to 6 cm in a real
+    // squat: the hip_roll and knee link frames carry equal and opposite ~10 deg
+    // pitch offsets that cancel only while hip roll and yaw are zero, which is
+    // never true in a loaded stance. The table below is transcribed from the
+    // compiled g1_23dof model (body_pos, body_quat, joint axis, foot site) and
+    // reproduces MuJoCo's own site position to 0.0000 mm over random poses.
+    //
+    // Joint indices follow deploy.yaml's order: 0-5 left leg, 6-11 right leg,
+    // each as (hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll) --
+    // the same order as the chain, so q[base + i] indexes it directly.
+    {
+        using Vec3 = Eigen::Vector3f;
+        using Quat = Eigen::Quaternionf;
+        const auto & q = env->robot->data.joint_pos;
+
+        // Foot site position in the pelvis frame, for one leg.
+        auto foot_in_body = [&](int base, float ys) -> Vec3 {
+            const Vec3 off[6] = {
+                Vec3( 0.00000f,  ys * 0.06445f, -0.10270f),
+                Vec3( 0.00000f,  ys * 0.05200f, -0.03046f),
+                Vec3( 0.02500f,  0.00000f,      -0.12412f),
+                Vec3(-0.07827f,  ys * 0.00215f, -0.17734f),
+                Vec3( 0.00000f, -ys * 0.00009f, -0.30001f),
+                Vec3( 0.00000f,  0.00000f,      -0.01756f),
+            };
+            // Link frame orientations. Only hip_roll and knee are non-identity.
+            const Quat bq[6] = {
+                Quat(1.0f, 0.0f,  0.00000f, 0.0f),
+                Quat(0.99618f, 0.0f, -0.08734f, 0.0f),
+                Quat(1.0f, 0.0f,  0.00000f, 0.0f),
+                Quat(0.99618f, 0.0f,  0.08734f, 0.0f),
+                Quat(1.0f, 0.0f,  0.00000f, 0.0f),
+                Quat(1.0f, 0.0f,  0.00000f, 0.0f),
+            };
+            const char axis[6] = { 'y', 'x', 'z', 'y', 'y', 'x' };
+
+            Vec3 p = Vec3::Zero();
+            Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+            for (int i = 0; i < 6; ++i) {
+                p += R * off[i];
+                const Vec3 a = (axis[i] == 'x') ? Vec3::UnitX()
+                             : (axis[i] == 'y') ? Vec3::UnitY()
+                                                : Vec3::UnitZ();
+                R = R * bq[i].toRotationMatrix()
+                      * Eigen::AngleAxisf(q[base + i], a).toRotationMatrix();
+            }
+            return Vec3(p + R * Vec3(0.04f, 0.0f, -0.037f));  // foot site
+        };
+
+        // Vertical drop from pelvis to a foot is the dot product of that foot's
+        // body-frame position with the unit gravity direction expressed in the
+        // body frame, so a leaning robot is handled without extra work.
+        // The LOWER foot is the larger drop -- the same reference the training
+        // reward uses, so a lifting swing foot does not move the reading.
+        const Vec3 & gb = env->robot->data.projected_gravity_b;
+        const float achieved = std::max(gb.dot(foot_in_body(0,  1.0f)),
+                                        gb.dot(foot_in_body(6, -1.0f)));
+
+        // Debug: command vs achievement, throttled to ~2 Hz (loop is ~50 Hz).
+        static int _bh_print = 0;
+        if (++_bh_print % 25 == 0) {
+            printf("[base_height] cmd = %.3f m | achieved = %.3f m | err = %+.3f m"
+                   "  (target %.3f, walking=%s)\n",
+                   h, achieved, achieved - h, target,
+                   (cmd_target > target + 1e-4f) ? "yes" : "no");
+            fflush(stdout);
+        }
     }
 
     return std::vector<float>{ h };
