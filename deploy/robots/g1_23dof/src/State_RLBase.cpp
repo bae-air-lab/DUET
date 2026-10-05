@@ -3,6 +3,7 @@
 #include "isaaclab/envs/mdp/observations/observations.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
 
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 
@@ -25,11 +26,54 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
         )
     );
 
+    // Runaway-policy guard: drop to Passive (damping) if the raw policy
+    // output stays above guard_max_abs_action_ for guard_hold_s_. Time-based
+    // because the checks run at the FSM rate, not the 50 Hz policy rate.
+    auto deploy_cfg = YAML::LoadFile(policy_dir / "params" / "deploy.yaml");
+    if (deploy_cfg["safety"]) {
+        auto s = deploy_cfg["safety"];
+        if (s["max_abs_action"]) guard_max_abs_action_ = s["max_abs_action"].as<float>();
+        if (s["max_abs_action_hold_s"]) guard_hold_s_ = s["max_abs_action_hold_s"].as<float>();
+    }
+    spdlog::info("RL guard: Passive if |raw action| > {:.1f} for {:.0f} ms",
+                 guard_max_abs_action_, 1000.0f * guard_hold_s_);
+    this->registered_checks.emplace_back(
+        std::make_pair(
+            [&]()->bool{ return action_runaway(); },
+            FSMStringMap.right.at("Passive")
+        )
+    );
+
     // Subscribe to upper-body (arm) targets published by the IL / GR00T policy on
     // a dedicated topic (reuses the LowCmd_ IDL, so no new message type). If no
     // message arrives within the timeout the arms fall back to the carry pose.
     arm_sub_ = std::make_shared<unitree::robot::g1::subscription::LowCmd>("rt/arm_targets");
     arm_sub_->set_timeout_ms(200);
+}
+
+bool State_RLBase::action_runaway()
+{
+    const auto raw = env->action_manager->action();
+    float peak = 0.0f;
+    for (float v : raw) peak = std::max(peak, std::fabs(v));
+
+    if (peak <= guard_max_abs_action_) {
+        guard_violating_ = false;
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!guard_violating_) {
+        guard_violating_ = true;
+        guard_since_ = now;
+        return false;
+    }
+    if (std::chrono::duration<float>(now - guard_since_).count() < guard_hold_s_) {
+        return false;
+    }
+    spdlog::error("RL guard: |raw action| {:.1f} > {:.1f} for {:.0f} ms -> Passive",
+                  peak, guard_max_abs_action_, 1000.0f * guard_hold_s_);
+    guard_violating_ = false;
+    return true;
 }
 
 void State_RLBase::run()

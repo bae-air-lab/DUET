@@ -5,6 +5,9 @@ stiffness: [40.2, 99.1, 40.2, 99.1, 28.5, 28.5, 40.2, 99.1, 40.2, 99.1, 28.5, 28
 damping:   [2.6, 6.3, 2.6, 6.3, 1.8, 1.8, 2.6, 6.3, 2.6, 6.3, 1.8, 1.8, 2.6,
             0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9]
 default_joint_pos: [-0.1,0,0,0.3,-0.2,0, -0.1,0,0,0.3,-0.2,0,  0,  0.35,0.18,0,0.87,0, 0.35,-0.18,0,0.87,0]
+safety:
+  max_abs_action: 15.0
+  max_abs_action_hold_s: 0.06
 
 commands:
   base_velocity:
@@ -62,7 +65,9 @@ commands:
     standstill: 0.78
 actions:
   JointPositionAction:
-    clip: null
+    clip: [[-3.22, 3.11], [-0.85, 3.29], [-2.98, 2.98], [-0.74, 3.34], [-1.99, 1.97], [-0.98, 0.96],
+           [-3.33, 3.11], [-3.29, 0.86], [-2.98, 2.98], [-0.74, 3.33], [-2.02, 1.97], [-0.95, 0.99],
+           [-2.86, 2.86]]
     joint_names: [.*]
     # Loco-manip carve-out: the RL policy controls ONLY the 13 lower-body joints
     # (12 legs + waist_yaw). The 10 arm joints are driven externally on the

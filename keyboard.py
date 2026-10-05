@@ -43,22 +43,22 @@ WZ_MAX = 0.6
 # height from D-pad press events and its own integrator, then clamps the result
 # to `commands.base_height.range` in deploy.yaml. So the values that actually
 # reach the policy are:
-#   idle standing  -> deploy.yaml `commands.base_height.standstill`  (0.73)
-#   D-pad Up/Down  -> integrated, then CLAMPED to `range`              (0.24..0.73)
-#   D-pad Right    -> `range` upper bound                              (0.73)
+#   idle standing  -> deploy.yaml `commands.base_height.standstill`  (0.78)
+#   D-pad Up/Down  -> integrated, then CLAMPED to `range`              (0.24..0.78)
+#   D-pad Right    -> `range` upper bound                              (0.78)
 #   D-pad Left     -> the literal in observations.h                    (0.60)
 #   walking floor  -> WALK_MIN in observations.h, clamps the target UP (0.60)
-# Walking inherits the standing target, so with standstill at 0.73 the robot
-# walks at 0.73 unless you press Left. The trained-range clamp lives in
+# Walking inherits the standing target, so with standstill at 0.78 the robot
+# walks at 0.78 unless you press Left. The trained-range clamp lives in
 # deploy.yaml; these constants mirror it so the two cannot silently disagree.
 # Changing the numbers here keeps this file self-consistent and documents the
 # intended posture, but it does not move the robot on its own.
-# Every value here is inside the TRAINED band (0.24 .. 0.73) of the CURRENTLY
-# deployed policy (arm_robust_v7 model_18000). Move these only when deploy.yaml moves. Nothing above
-# 0.73 and nothing below 0.24: outside that the policy extrapolates, and a deep
+# Every value here is inside the TRAINED band (0.24 .. 0.78) of the CURRENTLY
+# deployed policy (rough_seed1_50k_35000). Move these only when deploy.yaml moves. Nothing above
+# 0.78 and nothing below 0.24: outside that the policy extrapolates, and a deep
 # extrapolated squat drives the knee and hip past their soft limits, which on
 # hardware becomes a held stall current rather than a visible failure.
-RY_STAND = 0.73   # default standing AND walking height; top of the trained band
+RY_STAND = 0.78   # default standing AND walking height; top of the trained band
 RY_SQUAT = 0.24   # deepest TRAINED squat; deploy.yaml clamps the D-pad here
 RY_MID   = 0.60   # D-pad Left preset, the walk-band floor (set in observations.h)
 

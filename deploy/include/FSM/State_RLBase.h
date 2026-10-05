@@ -17,6 +17,8 @@ public:
     
     void enter()
     {
+        guard_violating_ = false;
+
         // set gain
         for (int i = 0; i < env->robot->data.joint_stiffness.size(); ++i)
         {
@@ -82,6 +84,14 @@ private:
     ArmPose arm_pose_ = ArmPose::DEFAULT;
     bool arm_prev_y_ = false;
     bool arm_prev_b_ = false;
+
+    // Runaway-policy guard (see the constructor in State_RLBase.cpp). Defaults
+    // are overridable from deploy.yaml `safety:`.
+    bool action_runaway();
+    float guard_max_abs_action_ = 15.0f;
+    float guard_hold_s_ = 0.06f;
+    bool guard_violating_ = false;
+    std::chrono::steady_clock::time_point guard_since_;
 };
 
 REGISTER_FSM(State_RLBase)

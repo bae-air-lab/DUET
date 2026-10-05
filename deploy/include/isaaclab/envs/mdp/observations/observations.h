@@ -153,7 +153,7 @@ REGISTER_OBSERVATION(base_height_command)
     if (joystick->up.pressed)   target += adj_step;
     if (joystick->down.pressed) target -= adj_step;
     if (joystick->left.pressed)  target = 0.60f;  // D-pad Left: walk-height preset (walk-band floor)
-    if (joystick->right.pressed) target = hi;     // D-pad Right: full-stand preset (top of range, 0.73)
+    if (joystick->right.pressed) target = hi;     // D-pad Right: full-stand preset (top of deploy.yaml range)
     target = std::clamp(target, lo, hi);
 
     // Velocity/height decoupling (Run-7 walk band): the policy learned to WALK at
