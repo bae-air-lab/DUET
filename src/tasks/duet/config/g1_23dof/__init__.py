@@ -40,3 +40,18 @@ register_mjlab_task(
 
 # Matched-budget, single-variable ablations (paper).
 from . import ablations  # noqa: E402,F401
+
+# Independent marching/litter experiment; existing task configurations above
+# remain unchanged and are covered by the before/after YAML snapshot audit.
+from .poultry_surface import (  # noqa: E402
+  poultry_surface_ppo_runner_cfg,
+  unitree_g1_23dof_duet_poultry_surface_env_cfg,
+)
+
+register_mjlab_task(
+  task_id="Unitree-G1-23Dof-Duet-PoultrySurface",
+  env_cfg=unitree_g1_23dof_duet_poultry_surface_env_cfg(),
+  play_env_cfg=unitree_g1_23dof_duet_poultry_surface_env_cfg(play=True),
+  rl_cfg=poultry_surface_ppo_runner_cfg(),
+  runner_cls=DuetOnPolicyRunner,
+)
