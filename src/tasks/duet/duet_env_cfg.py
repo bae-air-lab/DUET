@@ -43,7 +43,7 @@ from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.scene import SceneCfg
 from mjlab.sensor import GridPatternCfg, ObjRef, RayCastSensorCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
-from mjlab.terrains import TerrainEntityCfg
+from mjlab.terrains import FlatPatchSamplingCfg, TerrainEntityCfg
 from mjlab.terrains.config import ROUGH_TERRAINS_CFG
 # Import the twist command from mjlab, NOT from src.tasks.common.mdp, which
 # also defines a same-named variant. duet_eval.py isinstance-checks the mjlab
@@ -74,6 +74,30 @@ JOINT_VEL_NOISE = 1.5
 # 8 of the 20 columns the stairs did. Everything else is unchanged. Stairs are
 # not part of the deployment site (a poultry house), whereas soft, slippery
 # litter is. See ``src/tasks/common/terrains.py`` for the contact model.
+#
+# Spawn patches (2026-10-04). The heightfield tiles (slopes, random rough,
+# waves) used to spawn the robot at the tile-origin height, which on the
+# higher rows is below the surface under the feet: the first physics step
+# popped the feet out with 17-28 kN contact forces and 50-70 rad/s joint
+# velocities, the policy answered the out-of-distribution observation with
+# actions up to ~140, and action_rate_l2 / action_smoothness_l2 returned a
+# single-step reward near -150. Those outliers wrecked the critic and drove
+# the action-std runaway at 10.8k and 37k of the 50k Rough run, more often as
+# terrain levels rose. These tiles now carry flat patches near the centre
+# (within the old +-0.5 m spawn spread plus a little, so the distance-walked
+# terrain curriculum is not biased), and the Rough reset spawns on them at
+# their true surface height (``unitree_g1_23dof_duet_rough_env_cfg``). A tile
+# with no flat patch falls back to its centre at the true surface height.
+SPAWN_PATCH_NAME = "spawn"
+SPAWN_PATCHES = {
+  SPAWN_PATCH_NAME: FlatPatchSamplingCfg(
+    num_patches=10,
+    patch_radius=0.3,  # covers both feet around the pelvis
+    max_height_diff=0.04,
+    x_range=(3.25, 4.75),  # tile-local, tile centre at (4, 4)
+    y_range=(3.25, 4.75),
+  )
+}
 _ROUGH = ROUGH_TERRAINS_CFG.sub_terrains
 DUET_TERRAINS_CFG = replace(
   ROUGH_TERRAINS_CFG,
@@ -81,7 +105,7 @@ DUET_TERRAINS_CFG = replace(
     "flat": _ROUGH["flat"],
     "soft_floor": SoftFlatTerrainCfg(proportion=0.4),
     **{
-      name: sub
+      name: replace(sub, flat_patch_sampling=SPAWN_PATCHES)
       for name, sub in _ROUGH.items()
       if name not in ("flat", "pyramid_stairs", "pyramid_stairs_inv")
     },

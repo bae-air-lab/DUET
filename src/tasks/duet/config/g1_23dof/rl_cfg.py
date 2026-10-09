@@ -29,6 +29,14 @@ from src.tasks.duet.config.g1_23dof.env_cfgs import CURRICULUM_END_ITERS
 # than assumed to be the last one.
 MAX_ITERATIONS = 25_001
 SAVE_INTERVAL = 500
+# Rough: the stretched curriculum (env_cfgs.ROUGH_STRETCH) saturates at
+# 12,500, so 50k keeps ~37k iterations on the full task distribution.
+ROUGH_MAX_ITERATIONS = 50_001
+# Rough: per-step reward floor (dt-scaled units). A normal step is ~+0.08 and
+# a fall is -4 (is_terminated -200 x 0.02 s), so -5 never touches a normal or
+# a falling step; it only caps physics blow-ups, which reached ~-150 per step
+# in the 50k run (see SPAWN_PATCHES in duet_env_cfg.py).
+ROUGH_REWARD_FLOOR = -5.0
 
 
 @dataclass
@@ -80,6 +88,11 @@ class DuetPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
   """Two-stage entropy schedule; see ``EntropySchedule``. Set to ``None`` for a
   flat coefficient (then ``entropy_coef`` is used as-is)."""
 
+  reward_floor: float | None = None
+  """Clamp every per-step reward to at least this value before PPO sees it,
+  so a single physics blow-up cannot put an outlier into the value targets.
+  ``None`` (default) leaves rewards untouched."""
+
 
 def unitree_g1_23dof_duet_ppo_runner_cfg(
   max_iterations: int = MAX_ITERATIONS,
@@ -87,6 +100,7 @@ def unitree_g1_23dof_duet_ppo_runner_cfg(
   entropy_schedule: dict | None = None,
   experiment_name: str = "DUET_G1_23dof",
   seed: int = 42,
+  reward_floor: float | None = None,
 ) -> RslRlOnPolicyRunnerCfg:
   """Create the RL runner configuration.
 
@@ -97,6 +111,7 @@ def unitree_g1_23dof_duet_ppo_runner_cfg(
       the default two-stage schedule.
     experiment_name: Log directory name.
     seed: Overridden on the command line with ``--agent.seed``.
+    reward_floor: Per-step reward floor; ``None`` disables it.
   """
   algorithm = DuetPpoAlgorithmCfg(
     value_loss_coef=1.0,
@@ -113,6 +128,7 @@ def unitree_g1_23dof_duet_ppo_runner_cfg(
     desired_kl=0.01,
     max_grad_norm=1.0,
     symmetry_mode=symmetry_mode,
+    reward_floor=reward_floor,
   )
   if entropy_schedule is not None:
     algorithm.entropy_schedule = entropy_schedule

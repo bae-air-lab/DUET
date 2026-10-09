@@ -32,6 +32,10 @@ A mixture runs throughout: a slice of envs (50% -> 10%) keeps mild arm motion
 and a slice of height commands (50% -> 10%) stays at the nominal height, so
 clean locomotion is never crowded out of the batch.
 
+The Rough task stretches every knot after 1500 by ``ROUGH_STRETCH`` (2x):
+A 0-1500, B 1500-4500, C 4500-8500, D 8500-12500, E 12500+ on a 50k budget.
+Flat, DeployGains and the ablations keep the timing above.
+
 Curriculum state note: every ramp here is keyed on ``env.common_step_counter``,
 which ``MjlabOnPolicyRunner`` writes into and restores from the checkpoint.
 Resuming therefore continues the curriculum where it stopped. There is no
@@ -46,6 +50,7 @@ from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
@@ -57,7 +62,7 @@ from src.assets.robots import (
   get_g1_23dof_robot_cfg,
 )
 import src.tasks.duet.mdp as mdp
-from src.tasks.duet.duet_env_cfg import ITER, make_duet_env_cfg
+from src.tasks.duet.duet_env_cfg import ITER, SPAWN_PATCH_NAME, make_duet_env_cfg
 
 ##
 # Curriculum timing, sized for the 25k-iteration budget: every ramp saturates
@@ -67,6 +72,17 @@ from src.tasks.duet.duet_env_cfg import ITER, make_duet_env_cfg
 ##
 
 CURRICULUM_END_ITERS = 7_000
+
+# Rough-terrain stretch (2026-10-03). Stage A is kept: on Rough the policy
+# walked about as well as on Flat by iteration 1000 (reward 91 vs 101, falls
+# ~0.1), and a longer A would also slow terrain promotion, which needs >4 m
+# walked per episode under A's 0.6 m/s forward cap. Every knot after 1500 is
+# pushed out 2x, so the arm / push / squat / velocity ramps (B-D) run over
+# 1500-12500 instead of 1500-7000 while the terrain curriculum is also moving
+# robots onto harder tiles. The entropy schedule (rl_cfg.py) is tied to the
+# start of B at 1500 and is unchanged.
+ROUGH_STRETCH_AFTER = 1_500
+ROUGH_STRETCH = 2.0
 
 ##
 # Joint partition for the loco-manipulation carve-out.
@@ -297,7 +313,10 @@ TASK_ARM_POSE_NOISE = {
 
 
 def apply_duet_curriculum(
-  cfg: ManagerBasedRlEnvCfg, end_iters: int = CURRICULUM_END_ITERS
+  cfg: ManagerBasedRlEnvCfg,
+  end_iters: int = CURRICULUM_END_ITERS,
+  stretch_after: int = 0,
+  stretch: float = 1.0,
 ) -> None:
   """Install every staged schedule, scaled so all ramps saturate at ``end_iters``.
 
@@ -306,11 +325,21 @@ def apply_duet_curriculum(
   factor so the stages keep their relative timing. Curriculum state is read
   from ``env.common_step_counter``, which is checkpointed, so resuming
   continues every ramp where it stopped.
+
+  ``stretch`` > 1 leaves every knot up to ``stretch_after`` where it is and
+  pushes later knots out by that factor (Rough: ``ROUGH_STRETCH``), so the
+  saturation point becomes ``stretch_after + stretch * (end_iters -
+  stretch_after)``.
   """
   f = end_iters / CURRICULUM_END_ITERS
 
+  def warp(iters: float) -> float:
+    if iters <= stretch_after:
+      return iters
+    return stretch_after + stretch * (iters - stretch_after)
+
   def it(iters: float) -> int:
-    return int(round(iters * f)) * ITER
+    return int(round(warp(iters) * f)) * ITER
 
   arm = cfg.actions["upper_body_pose"]
   assert isinstance(arm, mdp.UpperBodyPoseActionCfg)
@@ -338,7 +367,7 @@ def apply_duet_curriculum(
     params={
       "command_name": "twist",
       "velocity_stages": [{"step": it(i), **r} for i, r in VELOCITY_STAGES],
-      "ramp_steps": it(VELOCITY_RAMP_ITERS),
+      "ramp_steps": int(round(VELOCITY_RAMP_ITERS * stretch * f)) * ITER,
     },
   )
   cfg.curriculum["command_mix"] = CurriculumTermCfg(
@@ -398,6 +427,8 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   command_curriculum: bool = True,
   joint_vel_noise: float | None = None,
   idle_precision: bool = True,
+  curriculum_stretch: float = ROUGH_STRETCH,
+  spawn_on_flat_patches: bool = True,
 ) -> ManagerBasedRlEnvCfg:
   """Create the G1-23DOF DUET rough-terrain configuration.
 
@@ -421,6 +452,12 @@ def unitree_g1_23dof_duet_rough_env_cfg(
     command_curriculum: When False, sample the final (hardest) command
       distribution from step 0 instead of staging into it.
     joint_vel_noise: Override the joint-velocity observation noise half-width.
+    curriculum_stretch: Factor applied to every curriculum knot after
+      ``ROUGH_STRETCH_AFTER``. Defaults to ``ROUGH_STRETCH``; the flat config
+      passes 1.0.
+    spawn_on_flat_patches: Reset onto the heightfield tiles' flat spawn
+      patches at their true surface height (see ``SPAWN_PATCHES`` in
+      ``duet_env_cfg.py``). The flat config turns it off.
   """
   cfg = make_duet_env_cfg()
 
@@ -518,6 +555,24 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   )
 
   cfg.viewer.body_name = "torso_link"
+
+  if spawn_on_flat_patches:
+    # Lift kept to 0-1 cm. A 3-5 cm lift was tried and is worse: the landing
+    # jolt ~8 steps after reset makes the same joint-velocity spike the pop
+    # did, on every tile. Measured on model_37000 (3000 steps x 4096 envs,
+    # training-level action noise), steps with reward below -5: original
+    # reset 99 (76 of them within 10 steps of a reset), patches + 0-1 cm 25
+    # (all on random_rough, which has no flat patch and falls back to its
+    # centre). The Rough reward floor (rl_cfg.ROUGH_REWARD_FLOOR) caps those.
+    cfg.events["reset_base"] = EventTermCfg(
+      func=envs_mdp.reset_root_state_from_flat_patches,
+      mode="reset",
+      params={
+        "patch_name": SPAWN_PATCH_NAME,
+        "pose_range": {"z": (0.0, 0.01), "yaw": (-3.14, 3.14)},
+        "velocity_range": {},
+      },
+    )
 
   ##
   # Commands.
@@ -702,7 +757,12 @@ def unitree_g1_23dof_duet_rough_env_cfg(
   ##
 
   if command_curriculum:
-    apply_duet_curriculum(cfg, CURRICULUM_END_ITERS)
+    apply_duet_curriculum(
+      cfg,
+      CURRICULUM_END_ITERS,
+      stretch_after=ROUGH_STRETCH_AFTER,
+      stretch=curriculum_stretch,
+    )
   else:
     # Ablation: no staging. Sample the final distribution from step 0.
     pin_duet_full_distribution(cfg)
@@ -746,8 +806,11 @@ def unitree_g1_23dof_duet_flat_env_cfg(
 
   The actor is already the 71-D deployed layout (``height_scan`` is critic-only
   in the base config); with no terrain to scan, the critic term and the
-  raycast sensor are dropped too.
+  raycast sensor are dropped too. The curriculum keeps the unstretched
+  7,000-iteration timing and the plain uniform reset.
   """
+  kwargs.setdefault("curriculum_stretch", 1.0)
+  kwargs.setdefault("spawn_on_flat_patches", False)
   cfg = unitree_g1_23dof_duet_rough_env_cfg(play=play, **kwargs)
 
   cfg.sim.njmax = 300
@@ -773,4 +836,76 @@ def unitree_g1_23dof_duet_flat_env_cfg(
     twist_cmd.ranges.lin_vel_y = (-0.5, 0.5)
     twist_cmd.ranges.ang_vel_z = (-0.5, 0.5)
 
+  return cfg
+
+
+# Squat-reach fine-tune (2026-10-04). On hardware, model_35000 in a deep squat
+# straightened its torso and drifted back when the arms went forward. Sim
+# reproduces it (+0.6 kg/hand, the real Dex3 + gripper + camera): the CoM sits
+# ~3.5 cm behind mid-foot in the squat, and with arms forward the torso leans
+# back 7-9 deg and the pelvis 1.5-2.5 cm instead of the CoM moving forward.
+# Deep squat with both arms forward was <1% of Rough training time. Poses are
+# left-side, mirrored for the right; the first two are the controller's own
+# gamepad presets (State_RLBase.cpp POSE_FORWARD / POSE_BOXHOLD).
+SQUAT_REACH_POSES = (
+  _arm_pose(pitch=-1.35, roll=0.50, yaw=0.0, elbow=0.87),  # gamepad Y: FORWARD
+  _arm_pose(pitch=-1.25, roll=0.00, yaw=0.0, elbow=0.70),  # gamepad B: BOX_HOLD
+  _arm_pose(pitch=-1.20, roll=0.10, yaw=0.0, elbow=0.30),  # forward reach
+  _arm_pose(pitch=-1.50, roll=0.10, yaw=0.0, elbow=0.00),  # arms straight forward
+  _arm_pose(pitch=-0.90, roll=0.10, yaw=0.0, elbow=0.30),  # forward-down reach
+  _arm_pose(pitch=-0.50, roll=0.12, yaw=0.0, elbow=1.00),  # box at chest
+  _arm_pose(pitch=0.60, roll=0.15, yaw=0.0, elbow=0.15),  # low pick
+)
+SQUAT_REACH_BELOW = 0.45
+
+
+def unitree_g1_23dof_duet_rough_squatreach_env_cfg(
+  play: bool = False, **kwargs
+) -> ManagerBasedRlEnvCfg:
+  """Rough plus deep-squat manipulation, for fine-tuning a Rough checkpoint.
+
+  Three changes, all confined to stationary deep squats:
+    * 60% of standing-env squat targets are drawn from [floor, 0.45 m], and
+      75% of arm goals drawn while squatting come from ``SQUAT_REACH_POSES``
+      (+ the usual per-joint noise). Measured with model_35000, deep squat
+      with both arms forward goes from ~1.5% of env time (Rough) to the value
+      noted at the registration;
+    * ``squat_com_centering`` pulls the whole-body CoM toward mid-foot;
+    * the torso-upright penalty relaxes further at depth (factor 0.15 below
+      0.35 m, full above 0.60 m) so leaning into a reach is not what it pays.
+  """
+  cfg = unitree_g1_23dof_duet_rough_env_cfg(play=play, **kwargs)
+
+  arm = cfg.actions["upper_body_pose"]
+  assert isinstance(arm, mdp.UpperBodyPoseActionCfg)
+  arm.squat_reach_poses = SQUAT_REACH_POSES
+  arm.squat_reach_prob = 0.75
+  arm.squat_reach_below = SQUAT_REACH_BELOW
+
+  base_height_cmd = cfg.commands["base_height"]
+  assert isinstance(base_height_cmd, mdp.BaseHeightCommandCfg)
+  base_height_cmd.deep_squat_fraction = 0.6
+  base_height_cmd.deep_squat_range = (HEIGHT_RANGE[0], SQUAT_REACH_BELOW)
+
+  orientation = cfg.rewards["body_orientation_l2"].params
+  orientation["relax_below"] = 0.35
+  orientation["full_above"] = 0.60
+  orientation["relax_factor"] = 0.15
+
+  # -3.0: a CoM 3.5 cm behind mid-foot (normalised ~0.35) costs ~0.37/s, an
+  # order of magnitude more than the extra torso lean needed to centre it.
+  cfg.rewards["squat_com_centering"] = RewardTermCfg(
+    func=mdp.squat_com_centering,
+    weight=-3.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "command_name": "twist",
+      "height_command_name": "base_height",
+      "squat_below": SQUAT_REACH_BELOW,
+      "full_above": 0.60,
+      "foot_half_length": 0.09,
+      "command_threshold": 0.1,
+      "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
+    },
+  )
   return cfg

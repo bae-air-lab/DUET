@@ -156,6 +156,23 @@ class UpperBodyPoseActionCfg(ActionTermCfg):
   shared or per joint pattern. Sampled independently per joint, so anchored
   goals are asymmetric too."""
 
+  # -- Optional squat-coupled reach poses -------------------------------------
+
+  squat_reach_poses: tuple[dict[str, float], ...] = ()
+  """Reach anchors used while the robot is squatting: an env whose height
+  command is below ``squat_reach_below`` draws its goal from these (plus
+  ``task_pose_noise``) with probability ``squat_reach_prob``. Couples arm
+  extension to squat depth, which the independent per-joint draw almost never
+  produces (deep squat + both arms forward was <1% of training time)."""
+
+  squat_reach_prob: float = 0.0
+  """Probability (per squatting env, per goal draw) of a squat-reach goal."""
+
+  squat_reach_below: float = 0.45
+  """Height command (m) below which an env counts as squatting."""
+
+  height_command_name: str = "base_height"
+
   def build(self, env: ManagerBasedRlEnv) -> UpperBodyPoseAction:
     return UpperBodyPoseAction(self, env)
 
@@ -221,12 +238,10 @@ class UpperBodyPoseAction(ActionTerm):
     self._arm_group = torch.tensor(groups, device=self.device, dtype=torch.long)
     self._num_groups = int(self._arm_group.max().item()) + 1  # init-time only
 
-    # Task-pose anchors, resolved to joint order.
-    self._task_anchors: torch.Tensor | None = None
-    self._task_noise: torch.Tensor | None = None
-    if cfg.task_poses:
+    # Task-pose and squat-reach anchors, resolved to joint order.
+    def _resolve_anchors(poses) -> torch.Tensor:
       anchors = []
-      for pose in cfg.task_poses:
+      for pose in poses:
         _, matched, values = resolve_matching_names_values(
           data=dict(pose), list_of_strings=joint_names
         )
@@ -236,7 +251,16 @@ class UpperBodyPoseAction(ActionTerm):
             f"Task pose {pose} does not cover all driven joints; missing {missing}."
           )
         anchors.append(torch.tensor(values, device=self.device, dtype=torch.float32))
-      self._task_anchors = torch.stack(anchors)  # [K, J]
+      return torch.stack(anchors)  # [K, J]
+
+    self._task_anchors: torch.Tensor | None = None
+    self._squat_anchors: torch.Tensor | None = None
+    self._task_noise: torch.Tensor | None = None
+    if cfg.task_poses:
+      self._task_anchors = _resolve_anchors(cfg.task_poses)
+    if cfg.squat_reach_poses:
+      self._squat_anchors = _resolve_anchors(cfg.squat_reach_poses)
+    if cfg.task_poses or cfg.squat_reach_poses:
       if isinstance(cfg.task_pose_noise, dict):
         _, _, noise_values = resolve_matching_names_values(
           data=dict(cfg.task_pose_noise), list_of_strings=joint_names
@@ -468,6 +492,19 @@ class UpperBodyPoseAction(ActionTerm):
       task_goal = torch.minimum(torch.maximum(anchor + noise, lo), hi)
       use_task = torch.rand(B, 1, device=dev) < cfg.task_pose_prob
       goal = torch.where(use_task, task_goal, goal)
+
+    # Squat-coupled reach anchors for envs currently commanded into a squat.
+    cmd_mgr = getattr(self._env, "command_manager", None)
+    if self._squat_anchors is not None and cfg.squat_reach_prob > 0.0 and cmd_mgr is not None:
+      assert self._task_noise is not None
+      height = cmd_mgr.get_command(cfg.height_command_name)[:, 0]
+      k = torch.randint(self._squat_anchors.shape[0], (B,), device=dev)
+      noise = (torch.rand(B, J, device=dev) * 2.0 - 1.0) * self._task_noise
+      squat_goal = torch.minimum(torch.maximum(self._squat_anchors[k] + noise, lo), hi)
+      use_squat = (height < cfg.squat_reach_below).unsqueeze(1) & (
+        torch.rand(B, 1, device=dev) < cfg.squat_reach_prob
+      )
+      goal = torch.where(use_squat, squat_goal, goal)
 
     # Stationary arm: with some probability an arm keeps its current pose while
     # the other one moves.

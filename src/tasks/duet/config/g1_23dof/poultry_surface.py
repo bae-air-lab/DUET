@@ -1,22 +1,76 @@
 """Independent poultry-surface task; existing DUET variants keep their configs."""
 
+from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 
+import src.tasks.duet.mdp as mdp
 from src.tasks.duet.mdp.poultry_surface import (
   PoultrySurfaceActionCfg,
+  backward_speed_deficit,
   poultry_clearance,
   poultry_foot_level,
   poultry_metric,
   poultry_plow,
   poultry_swing_height,
+  stop_backward_walkers,
 )
-from .env_cfgs import unitree_g1_23dof_duet_rough_env_cfg
-from .rl_cfg import unitree_g1_23dof_duet_ppo_runner_cfg
+from .env_cfgs import (
+  HEIGHT_RANGE,
+  SQUAT_REACH_POSES,
+  _arm_pose,
+  unitree_g1_23dof_duet_rough_env_cfg,
+)
+from .rl_cfg import ROUGH_REWARD_FLOOR, unitree_g1_23dof_duet_ppo_runner_cfg
 
 
 def unitree_g1_23dof_duet_poultry_surface_env_cfg(play=False, litter_enabled=True):
   cfg = unitree_g1_23dof_duet_rough_env_cfg(play=play)
+  # Cap every training stage as well as the unstaged play command range.
+  if "command_vel" in cfg.curriculum:
+    for stage in cfg.curriculum["command_vel"].params["velocity_stages"]:
+      lo, hi = stage["lin_vel_x"]
+      stage["lin_vel_x"] = (max(lo, -0.6), hi)
+  twist = cfg.commands["twist"]
+  lo, hi = twist.ranges.lin_vel_x
+  twist.ranges.lin_vel_x = (max(lo, -0.6), hi)
+  cfg.rewards["backward_speed_deficit"] = RewardTermCfg(
+    func=backward_speed_deficit, weight=-1.5,
+  )
+  cfg.events["stop_backward_walkers"] = EventTermCfg(
+    func=stop_backward_walkers, mode="interval", interval_range_s=(1.0, 3.0),
+    params={"prob": 0.3},
+  )
+
+  # Restore squat balance in this Rough-derived task, including medium-height
+  # squats and a fading centering penalty at the nominal standing height.
+  cfg.rewards["squat_com_centering"] = RewardTermCfg(
+    func=mdp.squat_com_centering, weight=-2.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "command_name": "twist",
+      "height_command_name": "base_height",
+      "squat_below": 0.65,
+      "full_above": 0.85,
+      "foot_half_length": 0.09,
+      "command_threshold": 0.1,
+      "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot")),
+    },
+  )
+  cfg.rewards["body_orientation_l2"].params.update(
+    relax_below=0.35, full_above=0.60, relax_factor=0.15,
+  )
+  arm = cfg.actions["upper_body_pose"]
+  arm.squat_reach_poses = SQUAT_REACH_POSES + (
+    _arm_pose(pitch=0.0, roll=1.2, yaw=0.0, elbow=0.30),
+    _arm_pose(pitch=-0.6, roll=0.9, yaw=0.0, elbow=0.50),
+  )
+  arm.squat_reach_prob = 0.75
+  arm.squat_reach_below = 0.65
+  cfg.commands["base_height"].deep_squat_fraction = 0.6
+  cfg.commands["base_height"].deep_squat_range = (HEIGHT_RANGE[0], 0.65)
+
   # The new task uses identifiable terrain columns even in play. Membership is
   # checked at each foot point's actual xy, including crossings between tiles.
   cfg.scene.terrain.terrain_generator.curriculum = True
@@ -60,4 +114,8 @@ def unitree_g1_23dof_duet_poultry_surface_env_cfg(play=False, litter_enabled=Tru
 
 
 def poultry_surface_ppo_runner_cfg():
-  return unitree_g1_23dof_duet_ppo_runner_cfg(experiment_name="DUET_G1_23dof_poultry")
+  return unitree_g1_23dof_duet_ppo_runner_cfg(
+    experiment_name="DUET_G1_23dof_poultry",
+    reward_floor=ROUGH_REWARD_FLOOR,
+    max_iterations=100_001,
+  )

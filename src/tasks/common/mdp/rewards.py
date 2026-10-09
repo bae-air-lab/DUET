@@ -896,6 +896,50 @@ def com_support_region(
   return cost
 
 
+def squat_com_centering(
+  env: ManagerBasedRlEnv,
+  sensor_name: str,
+  command_name: str,
+  height_command_name: str,
+  squat_below: float = 0.45,
+  full_above: float = 0.60,
+  foot_half_length: float = 0.09,
+  command_threshold: float = 0.1,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Quadratic pull of the whole-body CoM toward mid-foot in stationary squats.
+
+  Cost = (fore-aft CoM offset / fore-aft half-extent)^2, the same normalised
+  offset as :func:`_com_support_ratio` but fore-aft only, with no dead zone.
+  ``com_support_region`` is free inside half the region, so a deep squat that
+  parks the CoM ~3.5 cm behind mid-foot (measured on model_35000; arms forward
+  then make it straighten the torso and push the hips back rather than bring
+  the CoM forward) costs nothing there, and on hardware the heel side is where
+  it tips. Full weight at or below ``squat_below`` (height command), fading to
+  zero at ``full_above``; double support and zero twist command only, so
+  walking and standing tall are untouched.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  sensor: ContactSensor = env.scene[sensor_name]
+  com_xy = asset.data.data.subtree_com[:, asset.data.indexing.root_body_id, :2]
+  feet = asset.data.site_pos_w[:, asset_cfg.site_ids, :2]  # [B, 2, 2]
+  yaw = asset.data.heading_w
+  c, s_ = torch.cos(yaw), torch.sin(yaw)
+  d = com_xy - feet.mean(dim=1)
+  dx = c * d[:, 0] + s_ * d[:, 1]
+  fd = feet[:, 0] - feet[:, 1]
+  half_x = foot_half_length + 0.5 * (c * fd[:, 0] + s_ * fd[:, 1]).abs()
+  cost = torch.square(dx / half_x)
+
+  assert sensor.data.found is not None
+  cost = cost * ((sensor.data.found > 0).sum(dim=1) == 2).float()
+  height = env.command_manager.get_command(height_command_name)[:, 0]
+  cost = cost * ((full_above - height) / (full_above - squat_below)).clamp(0.0, 1.0)
+  twist = env.command_manager.get_command(command_name)
+  idle = (torch.norm(twist[:, :2], dim=1) + torch.abs(twist[:, 2])) <= command_threshold
+  return cost * idle.float()
+
+
 def action_smoothness_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
   """Penalize the SECOND difference of the actions (a jerk proxy).
 

@@ -69,6 +69,13 @@ class BaseHeightCommandCfg(CommandTermCfg):
   # standing/walking.
   nominal_env_fraction: float = 0.0
 
+  # Deep-squat bias: fraction of standing-env squat targets drawn from
+  # ``deep_squat_range`` (clamped to the current floor) instead of the full
+  # band, so the deep squats where manipulation happens get more of the batch.
+  # Applied before the nominal slice. 0 disables it.
+  deep_squat_fraction: float = 0.0
+  deep_squat_range: tuple[float, float] = (0.24, 0.45)
+
   def build(self, env: ManagerBasedRlEnv) -> BaseHeightCommand:
     return BaseHeightCommand(self, env)
 
@@ -132,6 +139,15 @@ class BaseHeightCommand(CommandTerm):
     self._squat_target[env_ids] = torch.empty(n, 1, device=self.device).uniform_(
       self.current_floor, hi
     )
+    if self.cfg.deep_squat_fraction > 0.0:
+      d_lo = max(self.current_floor, self.cfg.deep_squat_range[0])
+      d_hi = max(d_lo, min(hi, self.cfg.deep_squat_range[1]))
+      deep = torch.rand(n, 1, device=self.device) < self.cfg.deep_squat_fraction
+      self._squat_target[env_ids] = torch.where(
+        deep,
+        torch.empty(n, 1, device=self.device).uniform_(d_lo, d_hi),
+        self._squat_target[env_ids],
+      )
     # Walking envs use the comfortable bent-knee band [walk_min, top].
     self._walk_target[env_ids] = torch.empty(n, 1, device=self.device).uniform_(
       self.cfg.walk_min_height, hi

@@ -14,10 +14,35 @@ import numpy as np
 import torch
 
 from mjlab.managers.action_manager import ActionTerm, ActionTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.terrains import BoxFlatTerrainCfg
 from mjlab.utils.lab_api.math import matrix_from_quat
 
 from src.tasks.common.terrains import SoftFlatTerrainCfg
+
+
+def backward_speed_deficit(
+  env, command_name="twist", min_backward_cmd=0.05,
+  asset_cfg=SceneEntityCfg("robot"),
+):
+  """Penalize backward underspeed, without penalizing overspeed or forward motion."""
+  vx_cmd = env.command_manager.get_command(command_name)[:, 0]
+  vx = env.scene[asset_cfg.name].data.root_link_lin_vel_b[:, 0]
+  return (vx - vx_cmd).clamp_min(0.0) * (vx_cmd < -min_backward_cmd)
+
+
+def stop_backward_walkers(env, env_ids, prob=0.3, command_name="twist"):
+  """Hold a random subset of backward commands at zero until command resampling."""
+  term = env.command_manager.get_term(command_name)
+  if env_ids is None:
+    env_ids = torch.arange(env.num_envs, device=env.device)
+  backward = term.command[env_ids, 0] < -0.1
+  selected = backward & (torch.rand(len(env_ids), device=env.device) < prob)
+  stop_ids = env_ids[selected]
+  term.is_standing_env[stop_ids] = True
+  # Interval events run after command.compute(): expose the stop to this
+  # step's observations too. The standing flag keeps it zero on later steps.
+  term.command[stop_ids] = 0.0
 
 
 def point_kinematics(position, rotation, linear_velocity, angular_velocity, endpoints, radii):

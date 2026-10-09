@@ -92,9 +92,12 @@ class DuetOnPolicyRunner(MjlabOnPolicyRunner):
       # dump and the first update agree.
       algorithm["entropy_coef"] = self.entropy_schedule(0)
 
+    self._reward_floor = algorithm.pop("reward_floor", None)
+
     super().__init__(env, train_cfg, log_dir, device)
 
     self._install_entropy_schedule()
+    self._install_reward_floor()
     self._verify_symmetry()
 
   # -- Entropy schedule ------------------------------------------------------
@@ -122,6 +125,27 @@ class DuetOnPolicyRunner(MjlabOnPolicyRunner):
       return loss_dict
 
     self.alg.update = update_with_scheduled_entropy  # type: ignore[method-assign]
+
+  # -- Reward floor ----------------------------------------------------------
+
+  def _install_reward_floor(self) -> None:
+    """Clamp per-step rewards from below before PPO stores them.
+
+    ``learn()`` takes rewards straight from ``self.env.step``, so the clamp
+    wraps that call. The env's own ``Episode_Reward/*`` logs are computed
+    before it and stay unclamped, so a blow-up is still visible on the curves.
+    """
+    if self._reward_floor is None:
+      return
+    inner_step = self.env.step
+    floor = float(self._reward_floor)
+
+    def step_with_reward_floor(actions):
+      obs, rewards, dones, extras = inner_step(actions)
+      return obs, rewards.clamp(min=floor), dones, extras
+
+    self.env.step = step_with_reward_floor  # type: ignore[method-assign]
+    print(f"[INFO] per-step reward floor {floor} installed.")
 
   # -- Symmetry --------------------------------------------------------------
 
